@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List
+from typing import List, Optional
 
 import jinja2
 import torch
@@ -39,6 +39,30 @@ from ..utils import (
 from .utils import generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
+
+
+def _kv_uri_fragment(
+    dtype_kv: torch.dtype,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
+) -> str:
+    """Return the KV portion of a JIT URI.
+
+    Preserves backward-compatible `dtype_kv_X` form whenever K and V share
+    the same dtype (including when `dtype_k` and `dtype_v` are both left as
+    `None`, which is how existing symmetric callers invoke the URI builders).
+    Emits the asymmetric `dtype_k_X_dtype_v_Y` form only when K and V
+    genuinely differ — this keeps the JIT cache keyed identically to today
+    for every existing call site.
+    """
+    eff_k = dtype_k if dtype_k is not None else dtype_kv
+    eff_v = dtype_v if dtype_v is not None else dtype_kv
+    if eff_k == eff_v:
+        return f"dtype_kv_{filename_safe_dtype_map[eff_k]}"
+    return (
+        f"dtype_k_{filename_safe_dtype_map[eff_k]}_"
+        f"dtype_v_{filename_safe_dtype_map[eff_v]}"
+    )
 
 
 def get_single_decode_uri(
@@ -73,10 +97,13 @@ def get_batch_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"{_kv_uri_fragment(dtype_kv, dtype_k, dtype_v)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -381,10 +408,13 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"{_kv_uri_fragment(dtype_kv, dtype_k, dtype_v)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
@@ -916,6 +946,9 @@ def gen_batch_decode_module(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
     uri = get_batch_decode_uri(
         dtype_q,
@@ -927,6 +960,8 @@ def gen_batch_decode_module(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
     return gen_customize_batch_decode_module(
         uri,
@@ -950,6 +985,8 @@ def gen_batch_decode_module(
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
 
@@ -965,6 +1002,9 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -978,6 +1018,8 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1075,6 +1117,8 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
 
@@ -1443,7 +1487,17 @@ def gen_customize_batch_decode_module(
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
+    # Asymmetric K/V support: if either dtype_k or dtype_v is omitted,
+    # fall back to dtype_kv so every existing caller keeps working. The
+    # jinja templates have a matching `| default(dtype_kv)` filter on
+    # `dtype_k` and `dtype_v` so partial overrides are also fine.
+    eff_dtype_k = dtype_k if dtype_k is not None else dtype_kv
+    eff_dtype_v = dtype_v if dtype_v is not None else dtype_kv
+
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
         generate_additional_params(
@@ -1462,6 +1516,8 @@ def gen_customize_batch_decode_module(
         "variant_name": variant_name,
         "dtype_q": dtype_map[dtype_q],
         "dtype_kv": dtype_map[dtype_kv],
+        "dtype_k": dtype_map[eff_dtype_k],
+        "dtype_v": dtype_map[eff_dtype_v],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
         "head_dim_qk": head_dim_qk,
@@ -1526,12 +1582,22 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
+    # Asymmetric K/V support: fall back to dtype_kv if K or V dtype is
+    # unspecified. Jinja templates default dtype_k/dtype_v to dtype_kv so
+    # partial overrides work too.
+    eff_dtype_k = dtype_k if dtype_k is not None else dtype_kv
+    eff_dtype_v = dtype_v if dtype_v is not None else dtype_kv
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
         "dtype_q": dtype_map[dtype_q],
         "dtype_kv": dtype_map[dtype_kv],
+        "dtype_k": dtype_map[eff_dtype_k],
+        "dtype_v": dtype_map[eff_dtype_v],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
         "head_dim_qk": head_dim_qk,
