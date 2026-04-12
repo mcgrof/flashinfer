@@ -776,11 +776,13 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
   const uint32_t padded_batch_size = params.padded_batch_size;
 
-  // vec_size is based on the K type (the larger type in the FP16-K / FP8-V
-  // asymmetric case).  vec_size counts ELEMENTS per vector, not bytes —
-  // the byte-count difference is handled by vec_bits_k / vec_bits_v inside
-  // the kernel body.
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeK), HEAD_DIM / 32UL);
+  // vec_size must be large enough that both K and V cp_async loads reach
+  // the 128-bit minimum.  cp_async::pred_load requires num_bits in {128,256}.
+  // vec_bits = sizeof(DType) * vec_size * 8, so we need
+  //   sizeof(DType) * vec_size * 8 >= 128  =>  vec_size >= 16 / sizeof(DType).
+  // Using the smaller of the two element sizes ensures both meet the bound.
+  constexpr size_t min_kv_sizeof = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
+  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
