@@ -219,9 +219,9 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 
 
 @functools.cache
-def get_batch_decode_module(*args):
-    uri = get_batch_decode_uri(*args)
-    mod = gen_batch_decode_module(*args).build_and_load()
+def get_batch_decode_module(*args, dtype_k=None, dtype_v=None):
+    uri = get_batch_decode_uri(*args, dtype_k=dtype_k, dtype_v=dtype_v)
+    mod = gen_batch_decode_module(*args, dtype_k=dtype_k, dtype_v=dtype_v).build_and_load()
     plan_func = mod.plan
     run_func = mod.run
 
