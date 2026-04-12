@@ -855,6 +855,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        *,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -892,7 +895,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to
-            ``q_data_type``. Defaults to ``None``.
+            ``q_data_type``. Defaults to ``None``. When ``k_data_type`` or
+            ``v_data_type`` are also supplied (asymmetric K/V), this still
+            acts as the fallback for whichever of the two is omitted.
+        k_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key tensor only. Use this together with
+            ``v_data_type`` to request asymmetric K/V quantization (for
+            example ``k_data_type=torch.float16, v_data_type=torch.float8_e4m3fn``
+            for Qwen-safe deployments). If omitted, defaults to
+            ``kv_data_type``.
+        v_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the value tensor only. See ``k_data_type``.
+            If omitted, defaults to ``kv_data_type``.
         o_data_type : Optional[Union[str, torch.dtype]]
             The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
             For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
@@ -981,6 +995,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # Asymmetric K/V: if caller omitted either half, fall back to
+        # kv_data_type. When both are omitted (the common case) k and v
+        # dtypes both equal kv_data_type and every downstream URI is
+        # identical to the symmetric path, so no JIT cache churn.
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -994,6 +1018,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
@@ -1081,6 +1107,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
 
             args = [
@@ -1122,6 +1150,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -1313,8 +1343,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             page_size = k_cache.shape[2]
         _check_cached_qkv_data_type(
-            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+            q, k_cache, self._cached_q_data_type, self._cached_k_data_type
         )
+        # Asymmetric K/V: validate V dtype separately. The legacy helper
+        # above only checks K because kv_data_type used to cover both.
+        if v_cache.dtype != self._cached_v_data_type:
+            raise ValueError(
+                f"The dtype of v {v_cache.dtype} does not match the "
+                f"v_data_type {self._cached_v_data_type} specified in plan "
+                f"(kv_data_type was {self._cached_kv_data_type}). Pass "
+                f"k_data_type and v_data_type explicitly if you intended "
+                f"an asymmetric K/V cache."
+            )
         actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
         expected_q_len = actual_batch_size * q_len_per_req
         if q.size(0) != expected_q_len:
