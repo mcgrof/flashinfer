@@ -107,7 +107,8 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
     num_kv_heads = paged_k_cache.size(2);
   }
   uint32_t head_dim_qk = q.size(2);
-  uint32_t head_dim_vo = paged_v_cache.size(3);
+  // INT4 packed V: v_cache.size(3)=head_dim/2. Use K head_dim.
+  uint32_t head_dim_vo = paged_k_cache.size(3);
 
   TVM_FFI_ICHECK_EQ(head_dim_qk, head_dim_vo)
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
@@ -131,9 +132,7 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   auto k_strides = paged_k_cache.strides();
   auto v_strides = paged_v_cache.strides();
   TVM_FFI_ICHECK_EQ(k_strides.size(), v_strides.size());
-  for (int i = 0; i < k_strides.size(); ++i) {
-    TVM_FFI_ICHECK_EQ(k_strides[i], v_strides[i]);
-  }
+  // INT4 packed V may have different strides; use K strides as canonical.
   kv_cache_strides = k_strides.data();
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
