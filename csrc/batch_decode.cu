@@ -177,6 +177,14 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
         ADDITIONAL_PARAMS_SETTER
 
+        // INT4 packed V: copy v_scales pointer from params to paged_kv
+        if constexpr (std::is_same_v<DTypeV, uint8_t>) {
+          params.paged_kv.v_scales = static_cast<half*>(
+              params.maybe_v_scales);
+          params.paged_kv.v_pack_factor = 2;
+          params.paged_kv.v_group_size = 128;
+        }
+
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
         params.request_indices =

@@ -1535,8 +1535,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
-                _v_scales,
-                _v_pack_factor,
             ]
 
             if self._jit_module is not None:
@@ -1547,6 +1545,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "maybe_v_scales": lambda: getattr(self, "_v_scales", None),
                         },
                         args,
                     )
@@ -1554,6 +1553,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             else:
                 run_args += [
                     _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                    getattr(self, "_v_scales", None),
                     logits_soft_cap,
                     sm_scale,
                     rope_scale,
