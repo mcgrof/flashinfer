@@ -87,7 +87,9 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                     TensorView paged_kv_indices, TensorView paged_kv_last_page_len,
                                     TensorView o, Optional<TensorView> maybe_lse,
                                     int64_t kv_layout_code, int64_t window_left,
-                                    bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+                                    bool enable_pdl,
+                                    Optional<TensorView> maybe_v_scales,
+                                    int64_t v_pack_factor ADDITIONAL_FUNC_PARAMS) {
   CHECK_INPUT_TYPE(paged_kv_indptr, dl_int32);
   CHECK_INPUT_TYPE(paged_kv_indices, dl_int32);
   CHECK_INPUT_TYPE(paged_kv_last_page_len, dl_int32);
@@ -148,6 +150,12 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
+
+        // INT4 packed V: set scales and pack factor
+        if (maybe_v_scales.has_value()) {
+          paged_kv.v_scales = static_cast<half*>(maybe_v_scales.value().data_ptr());
+          paged_kv.v_pack_factor = static_cast<uint32_t>(v_pack_factor);
+        }
 
         Params params;
         params.q = static_cast<DTypeQ*>(q.data_ptr());

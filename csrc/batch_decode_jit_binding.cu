@@ -34,7 +34,9 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                     TensorView paged_kv_indices, TensorView paged_kv_last_page_len,
                                     TensorView o, Optional<TensorView> maybe_lse,
                                     int64_t kv_layout_code, int64_t window_left,
-                                    bool enable_pdl ADDITIONAL_FUNC_PARAMS);
+                                    bool enable_pdl,
+                                    Optional<TensorView> maybe_v_scales,
+                                    int64_t v_pack_factor ADDITIONAL_FUNC_PARAMS);
 
 // Batched decode with paged KV-Cache plan
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, BatchDecodeWithPagedKVCachePlan);

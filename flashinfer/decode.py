@@ -1020,6 +1020,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._cached_kv_data_type = kv_data_type
         self._cached_k_data_type = k_data_type
         self._cached_v_data_type = v_data_type
+        # INT4 packed V: caller sets these before run()
+        self._v_scales = None
+        self._v_pack_factor = 1
+        if v_data_type == torch.uint8:
+            self._v_pack_factor = 2  # INT4: 2 values per byte
         self._cached_o_data_type = o_data_type
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
@@ -1511,6 +1516,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 plan_info = self._plan_info
             assert plan_info is not None, "plan info is not initialized"
 
+            # INT4 packed V: pass v_scales tensor and pack factor
+            _v_scales = getattr(self, '_v_scales', None)
+            _v_pack_factor = getattr(self, '_v_pack_factor', 1)
+
             run_args = [
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1526,6 +1535,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 TensorLayout[self._kv_layout].value,
                 window_left,
                 enable_pdl,
+                _v_scales,
+                _v_pack_factor,
             ]
 
             if self._jit_module is not None:
