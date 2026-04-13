@@ -144,6 +144,57 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
   }
 }
 
+
+/*!
+ * \brief INT4 packed V variant of update_local_state.
+ *
+ * When V is stored as packed INT4 (2 values per uint8), this function
+ * unpacks nibbles from shared memory and applies per-group symmetric
+ * dequantization scales before accumulating into the attention state.
+ *
+ * \tparam vec_size Logical vector size (number of float output elements per thread)
+ * \tparam bdx Block dimension x (threads per warp-group)
+ * \tparam tile_size Number of KV tokens per tile
+ * \param v_smem_packed Pointer to packed uint8 V data in shared memory
+ * \param v_scales_smem Pointer to per-group FP16 scales in shared memory
+ * \param s Pre-softmax attention scores for this tile
+ * \param compute_stage_idx Pipeline stage index (unused, kept for API compat)
+ * \param st FlashAttention state to update
+ * \param tx Thread index within bdx
+ * \param head_dim Logical head dimension (number of float elements)
+ * \param group_size Elements per scale group
+ */
+template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size>
+__device__ __forceinline__ void update_local_state_int4v(
+    const uint8_t* v_smem_packed,
+    const half* v_scales_smem,
+    const float* s,
+    uint32_t compute_stage_idx,
+    state_t<vec_size>& st,
+    uint32_t tx,
+    uint32_t head_dim,
+    uint32_t group_size) {
+#pragma unroll
+  for (uint32_t j = 0; j < tile_size; ++j) {
+    // Each thread handles vec_size logical elements.
+    // In packed format, vec_size/2 bytes encode vec_size INT4 values.
+    const uint32_t packed_offset = (j * bdx + tx) * (vec_size / 2);
+    const uint32_t elem_base = tx * vec_size;
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; i += 2) {
+      uint8_t packed = v_smem_packed[packed_offset + i / 2];
+      uint32_t group_idx = (elem_base + i) / group_size;
+      // Scales layout in smem: [tile_size, num_groups_per_head]
+      uint32_t num_groups = head_dim / group_size;
+      float scale = __half2float(v_scales_smem[j * num_groups + group_idx]);
+      float lo, hi;
+      dequant_int4x2_to_float(packed, scale, lo, hi);
+      st.o[i]     = st.o[i]     + s[j] * lo;
+      st.o[i + 1] = st.o[i + 1] + s[j] * hi;
+    }
+  }
+}
+
 /*!
  * \brief Synchronize the state of all warps inside a threadblock.
  * \tparam vec_size A template integer indicates the vector size
