@@ -2061,3 +2061,40 @@ FLASHINFER_INLINE vec2_dtype_t<T> get_vec2_element(vec_t<T, VEC_SIZE>& vec, int 
 }  // namespace flashinfer
 
 #endif  // VEC_DTYPES_CUH_
+
+// ---------- INT4 packed dequantization utilities ----------
+
+/*!
+ * \brief Unpack 8 symmetric INT4 values from a uint32 and dequantize to 8 floats.
+ *
+ * Each uint32 contains 8 nibbles (4-bit signed values in [-8,7]).
+ * Symmetric quantization: dequantized_value = int4_value * scale.
+ *
+ * This function is the INT4 analogue of fast_dequant_f8f16x4 and lives
+ * in the same header so the decode kernel can call it from registers
+ * without any global-memory round-trip.
+ */
+__device__ __forceinline__ void dequant_int4x8_to_float(
+    uint32_t packed, float scale, float* __restrict__ out) {
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int nibble = (packed >> (i * 4)) & 0xF;
+    // Symmetric signed: map [0,15] -> [-8,7]
+    int signed_val = nibble - 8;
+    out[i] = __int2float_rn(signed_val) * scale;
+  }
+}
+
+/*!
+ * \brief Unpack 2 symmetric INT4 values from a uint8 and dequantize to 2 floats.
+ *
+ * Low nibble first, high nibble second. Symmetric: value = (nibble - 8) * scale.
+ */
+__device__ __forceinline__ void dequant_int4x2_to_float(
+    uint8_t packed, float scale, float& out_lo, float& out_hi) {
+  int lo = (int)(packed & 0x0F) - 8;
+  int hi = (int)((packed >> 4) & 0x0F) - 8;
+  out_lo = __int2float_rn(lo) * scale;
+  out_hi = __int2float_rn(hi) * scale;
+}
+

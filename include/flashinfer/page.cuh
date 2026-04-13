@@ -72,6 +72,16 @@ struct paged_kv_t {
   // [batch_size] The start position of each request in the batch.
   IdType* rope_pos_offset;
 
+  // INT4 packed V support. When v_pack_factor > 1, v_data stores
+  // packed elements (e.g., 2 INT4 values per uint8). The logical
+  // head_dim stays the same, but V pointer arithmetic divides by
+  // v_pack_factor. v_scales stores per-group dequantization scales.
+  // When v_pack_factor == 1 (the default), these fields are unused
+  // and the V path behaves identically to the existing code.
+  uint32_t v_pack_factor;   // 1 = no packing, 2 = INT4 packed
+  uint32_t v_group_size;    // elements per scale group (default 128)
+  half* v_scales;           // [max_num_pages, page_size, num_heads, head_dim/group_size]
+
   /*!
    * \brief Construct an empty paged key-value cache
    */
@@ -88,7 +98,10 @@ struct paged_kv_t {
         indices(nullptr),
         indptr(nullptr),
         last_page_len(nullptr),
-        rope_pos_offset(nullptr) {}
+        rope_pos_offset(nullptr),
+        v_pack_factor(1),
+        v_group_size(128),
+        v_scales(nullptr) {}
 
   /*!
    * \brief Construct a paged key-value cache
