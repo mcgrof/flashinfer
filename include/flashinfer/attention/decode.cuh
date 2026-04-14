@@ -350,7 +350,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   uint32_t producer_kv_idx_base = chunk_start;
   constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
   // INT4 packed: each byte holds 2 values, so load half the bytes per thread.
-  constexpr uint32_t vec_bits_v = int4v ? (vec_size / 2 * 8) : (sizeof(DTypeV) * vec_size * 8);
+  constexpr uint32_t vec_bits_v = int4v ? std::max(128u, vec_size / 2 * 8) : (sizeof(DTypeV) * vec_size * 8);
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -570,7 +570,7 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   uint32_t stage_idx = 0;
   constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
   // INT4 packed: each byte holds 2 values, so load half the bytes per thread.
-  constexpr uint32_t vec_bits_v = int4v ? (vec_size / 2 * 8) : (sizeof(DTypeV) * vec_size * 8);
+  constexpr uint32_t vec_bits_v = int4v ? std::max(128u, vec_size / 2 * 8) : (sizeof(DTypeV) * vec_size * 8);
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   static_assert(num_stages_smem <= bdx);
@@ -797,7 +797,11 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   // the 128-bit minimum.  Using the smaller of the two element sizes
   // ensures both meet the bound.
   constexpr size_t min_kv_sizeof = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
-  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
+  // INT4 packed: each byte holds 2 values, so min cp_async (128 bits = 16 bytes)
+  // loads 32 INT4 values. vec_size must be >= 32 for INT4 to ensure
+  // vec_size/2 bytes >= 16 bytes per cp_async load.
+  constexpr size_t cp_async_min_elems = is_int4_packed_v_v<DTypeV> ? 32UL : 16UL;
+  constexpr uint32_t vec_size = std::max(cp_async_min_elems / min_kv_sizeof, HEAD_DIM / 32UL);
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   auto compute_capacity = GetCudaComputeCapability();
   static_assert(bdx <= 32U);
@@ -895,7 +899,11 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   //   sizeof(DType) * vec_size * 8 >= 128  =>  vec_size >= 16 / sizeof(DType).
   // Using the smaller of the two element sizes ensures both meet the bound.
   constexpr size_t min_kv_sizeof = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
-  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
+  // INT4 packed: each byte holds 2 values, so min cp_async (128 bits = 16 bytes)
+  // loads 32 INT4 values. vec_size must be >= 32 for INT4 to ensure
+  // vec_size/2 bytes >= 16 bytes per cp_async load.
+  constexpr size_t cp_async_min_elems = is_int4_packed_v_v<DTypeV> ? 32UL : 16UL;
+  constexpr uint32_t vec_size = std::max(cp_async_min_elems / min_kv_sizeof, HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);

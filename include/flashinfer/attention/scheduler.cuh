@@ -158,7 +158,8 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   using IdType = typename Params::IdType;
   // Must match the vec_size in BatchDecodeWithPagedKVCacheDispatched.
   constexpr size_t min_kv_sizeof = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
-  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
+  constexpr size_t cp_async_min_elems = is_int4_packed_v_v<DTypeV> ? 32UL : 16UL;
+  constexpr uint32_t vec_size = std::max(cp_async_min_elems / min_kv_sizeof, HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
