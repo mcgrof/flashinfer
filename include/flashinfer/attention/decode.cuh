@@ -199,12 +199,8 @@ __device__ __forceinline__ void update_local_state_int4v(
       uint32_t group_idx = (elem_base + byte4 * 2) / group_size;
       float scale = __half2float(v_scales_smem[j * num_groups + group_idx]);
       float ws = s[j] * scale;
-      // Fuse bias: (nibble - 8) * ws = nibble * ws - 8 * ws
-      // Precompute bias once, eliminate per-value subtract.
       float ws_bias = ws * 8.0f;
       uint32_t ob = byte4 * 2;
-      // Each value: shift + mask + uint2float + FMA + subtract bias
-      // The uint2float is cheaper than int2float (no sign handling)
       st.o[ob + 0] += ws * __uint2float_rn((packed4 >>  0) & 0xFu) - ws_bias;
       st.o[ob + 1] += ws * __uint2float_rn((packed4 >>  4) & 0xFu) - ws_bias;
       st.o[ob + 2] += ws * __uint2float_rn((packed4 >>  8) & 0xFu) - ws_bias;
@@ -216,6 +212,7 @@ __device__ __forceinline__ void update_local_state_int4v(
     }
   }
 }
+
 
 /*!
  * \brief Synchronize the state of all warps inside a threadblock.
@@ -537,8 +534,6 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       (head_dim * sizeof(DTypeV));
   // Number of V elements per thread load: vec_size/2 bytes for INT4, vec_size*sizeof(DTypeV) bytes otherwise
   constexpr size_t v_vec_bytes = int4v ? (vec_size / 2) : (vec_size * sizeof(DTypeV));
-  // INT4 packed: vec_size/2 bytes per element (2 INT4 per byte).
-  // 64-bit cp.async only needs 8-byte alignment, no padding.
   constexpr size_t v_tile_bytes = int4v ?
       (kv_tile_elems / 2) : (kv_tile_elems * sizeof(DTypeV));
   constexpr size_t num_tile_tokens = num_stages_smem * tile_size_per_bdx * bdy * bdz;
@@ -704,6 +699,9 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     if constexpr (int4v) {
+      // Tile-level INT4→INT8 expansion: unpack nibbles into signed INT8
+      // in the second half of each thread's V smem slot. Runs once per
+      // tile, amortized over all QK tokens.
       update_local_state_int4v<vec_size, bdx, bdy * tile_size_per_bdx>(
           (const uint8_t*)(v_smem) + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * (head_dim / 2),
           v_scales_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * (head_dim / params.paged_kv.v_group_size),
