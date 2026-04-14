@@ -192,28 +192,27 @@ __device__ __forceinline__ void update_local_state_int4v(
   for (uint32_t j = 0; j < tile_size; ++j) {
     const uint32_t packed_byte_offset = (j * bdx + tx) * (vec_size / 2);
     const uint32_t elem_base = tx * vec_size;
-    // Process vec_size/2 packed bytes in chunks of 4 (uint32 loads).
-    // Each uint32 = 4 bytes = 8 INT4 values.
 #pragma unroll
     for (uint32_t byte4 = 0; byte4 < vec_size / 2; byte4 += 4) {
-      // Single 32-bit smem load: 4 packed bytes = 8 INT4 values
       uint32_t packed4 = *reinterpret_cast<const uint32_t*>(
           v_smem_packed + packed_byte_offset + byte4);
-      // Per-group scale. group_size=128, head_dim=128 => 1 scale.
       uint32_t group_idx = (elem_base + byte4 * 2) / group_size;
       float scale = __half2float(v_scales_smem[j * num_groups + group_idx]);
-      // Hoist weight * scale: one multiply for all 8 values.
       float ws = s[j] * scale;
-      // Extract 8 nibbles + accumulate. All 8 are independent => full ILP.
+      // Fuse bias: (nibble - 8) * ws = nibble * ws - 8 * ws
+      // Precompute bias once, eliminate per-value subtract.
+      float ws_bias = ws * 8.0f;
       uint32_t ob = byte4 * 2;
-      st.o[ob + 0] += ws * __int2float_rn((int)((packed4 >>  0) & 0xFu) - 8);
-      st.o[ob + 1] += ws * __int2float_rn((int)((packed4 >>  4) & 0xFu) - 8);
-      st.o[ob + 2] += ws * __int2float_rn((int)((packed4 >>  8) & 0xFu) - 8);
-      st.o[ob + 3] += ws * __int2float_rn((int)((packed4 >> 12) & 0xFu) - 8);
-      st.o[ob + 4] += ws * __int2float_rn((int)((packed4 >> 16) & 0xFu) - 8);
-      st.o[ob + 5] += ws * __int2float_rn((int)((packed4 >> 20) & 0xFu) - 8);
-      st.o[ob + 6] += ws * __int2float_rn((int)((packed4 >> 24) & 0xFu) - 8);
-      st.o[ob + 7] += ws * __int2float_rn((int)((packed4 >> 28) & 0xFu) - 8);
+      // Each value: shift + mask + uint2float + FMA + subtract bias
+      // The uint2float is cheaper than int2float (no sign handling)
+      st.o[ob + 0] += ws * __uint2float_rn((packed4 >>  0) & 0xFu) - ws_bias;
+      st.o[ob + 1] += ws * __uint2float_rn((packed4 >>  4) & 0xFu) - ws_bias;
+      st.o[ob + 2] += ws * __uint2float_rn((packed4 >>  8) & 0xFu) - ws_bias;
+      st.o[ob + 3] += ws * __uint2float_rn((packed4 >> 12) & 0xFu) - ws_bias;
+      st.o[ob + 4] += ws * __uint2float_rn((packed4 >> 16) & 0xFu) - ws_bias;
+      st.o[ob + 5] += ws * __uint2float_rn((packed4 >> 20) & 0xFu) - ws_bias;
+      st.o[ob + 6] += ws * __uint2float_rn((packed4 >> 24) & 0xFu) - ws_bias;
+      st.o[ob + 7] += ws * __uint2float_rn((packed4 >> 28) & 0xFu) - ws_bias;
     }
   }
 }
