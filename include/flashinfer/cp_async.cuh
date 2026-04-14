@@ -96,6 +96,37 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
  * \param predicate Predicate value
  * \note fill zero is slower than not fill zero
  */
+
+/*!
+ * \brief 64-bit (8-byte) cp.async for INT4 packed V loads.
+ * Requires 8-byte alignment on both source and destination.
+ */
+template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
+__device__ __forceinline__ void pred_load_64b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+    int src_in_bytes = predicate ? 8 : 0;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;\n"
+                 ::"r"(smem_int_ptr), "l"(gmem_ptr), "n"(8), "r"(src_in_bytes));
+  } else {
+    asm volatile(
+        "{\n"
+        " .reg .pred p;\n"
+        " setp.ne.b32 p, %0, 0;\n"
+        " @p cp.async.ca.shared.global [%1], [%2], %3;\n"
+        "}\n" ::"r"((int)predicate),
+        "r"(smem_int_ptr), "l"(gmem_ptr), "n"(8));
+  }
+#else
+  if (predicate) {
+    *reinterpret_cast<uint2*>(smem_ptr) = *reinterpret_cast<const uint2*>(gmem_ptr);
+  } else if constexpr (fill_mode == SharedMemFillMode::kFillZero) {
+    *reinterpret_cast<uint2*>(smem_ptr) = make_uint2(0, 0);
+  }
+#endif
+}
+
 template <PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
 __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
 #ifdef FLASHINFER_CP_ASYNC_ENABLED
@@ -149,7 +180,7 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, b
  */
 template <size_t num_bits, PrefetchMode prefetch_mode, typename T>
 __device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
-  static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
+  static_assert(num_bits == 128 || num_bits == 256, "load() requires 128 or 256 bits");
   if constexpr (num_bits == 128) {
     load_128b<prefetch_mode>(smem_ptr, gmem_ptr);
   } else {
@@ -172,8 +203,11 @@ __device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
  */
 template <size_t num_bits, PrefetchMode prefetch_mode, SharedMemFillMode fill_mode, typename T>
 __device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool predicate) {
-  static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
-  if constexpr (num_bits == 128) {
+  static_assert(num_bits == 64 || num_bits == 128 || num_bits == 256,
+                "num_bits must be 64, 128, or 256");
+  if constexpr (num_bits == 64) {
+    pred_load_64b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
+  } else if constexpr (num_bits == 128) {
     pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
   } else {
     pred_load_128b<prefetch_mode, fill_mode>(smem_ptr, gmem_ptr, predicate);
