@@ -618,15 +618,20 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       if constexpr (int4v) {
-        // INT4 packed: cp_async loads vec_size bytes (128 bits) into
-        // padded V smem. Source is packed global array at v_offset.
+        // INT4 packed: 64-bit vectorized load into padded V smem.
         size_t v_offset_base = kv_offset[j] - tx * vec_size;
         size_t v_offset = v_offset_base / 2 + tx * (vec_size / 2);
-        cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
-            v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
-                tx * vec_size,
-            paged_kv.v_data + v_offset,
-            ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+        DTypeV* v_smem_dst = v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size;
+        bool valid = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+        if (valid) {
+          // Load vec_size/2=8 bytes as two uint32_t (64 bits total)
+          const uint32_t* src32 = reinterpret_cast<const uint32_t*>(paged_kv.v_data + v_offset);
+          uint32_t* dst32 = reinterpret_cast<uint32_t*>(v_smem_dst);
+          dst32[0] = __ldg(src32);
+          dst32[1] = __ldg(src32 + 1);
+        } else {
+          reinterpret_cast<uint2*>(v_smem_dst)[0] = make_uint2(0, 0);
+        }
       } else {
         cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -707,11 +712,16 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       if constexpr (int4v) {
         size_t v_offset_base = kv_offset[j] - tx * vec_size;
         size_t v_offset = v_offset_base / 2 + tx * (vec_size / 2);
-        cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
-            v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
-                tx * vec_size,
-            paged_kv.v_data + v_offset,
-            (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+        DTypeV* v_smem_dst = v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim + tx * vec_size;
+        bool valid = (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+        if (valid) {
+          const uint32_t* src32 = reinterpret_cast<const uint32_t*>(paged_kv.v_data + v_offset);
+          uint32_t* dst32 = reinterpret_cast<uint32_t*>(v_smem_dst);
+          dst32[0] = __ldg(src32);
+          dst32[1] = __ldg(src32 + 1);
+        } else {
+          reinterpret_cast<uint2*>(v_smem_dst)[0] = make_uint2(0, 0);
+        }
       } else {
         cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
