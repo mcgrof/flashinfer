@@ -832,6 +832,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
               sizeof(DTypeK) +
           NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz *
               (is_int4_packed_v_v<DTypeV> ? (HEAD_DIM / 2) : (HEAD_DIM * sizeof(DTypeV))) +
+          (is_int4_packed_v_v<DTypeV> ?
+              (NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * (HEAD_DIM / 32) * sizeof(half)) : 0) +
           2U * bdy * bdz * sizeof(float);
       auto kernel =
           SingleDecodeWithKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
@@ -931,6 +933,9 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
               sizeof(DTypeK) +
           NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz *
               (is_int4_packed_v_v<DTypeV> ? (HEAD_DIM / 2) : (HEAD_DIM * sizeof(DTypeV))) +
+          // INT4 v_scales smem: num_tile_tokens * (head_dim/group_size) * sizeof(half)
+          (is_int4_packed_v_v<DTypeV> ?
+              (NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * (HEAD_DIM / 32) * sizeof(half)) : 0) +
           std::max(tile_size_per_bdx * num_threads * sizeof(size_t),
                    2 * bdy * bdz * sizeof(float));
       auto kernel =
