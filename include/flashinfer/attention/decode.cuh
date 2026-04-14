@@ -191,7 +191,9 @@ __device__ __forceinline__ void update_local_state_int4v(
   for (uint32_t j = 0; j < tile_size; ++j) {
     // Each thread handles vec_size logical elements.
     // In packed format, vec_size/2 bytes encode vec_size INT4 values.
-    const uint32_t packed_offset = (j * bdx + tx) * (vec_size / 2);
+    // Padded smem: thread's data starts at tx*vec_size, first
+    // vec_size/2 bytes are the packed INT4 values.
+    const uint32_t packed_offset = (j * bdx + tx) * vec_size;
     const uint32_t elem_base = tx * vec_size;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; i += 2) {
@@ -351,10 +353,11 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   constexpr bool int4v = is_int4_packed_v_v<DTypeV>;
   constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
   // INT4 packed: each byte holds 2 values, so load half the bytes per thread.
-  // INT4 V uses direct loads (not cp_async) because the packed byte
-  // width (vec_size/2 * 8 = 64 bits) is below cp_async's 128-bit minimum.
-  // For non-INT4, vec_bits_v is used by cp_async as normal.
-  constexpr uint32_t vec_bits_v = int4v ? 128 : (sizeof(DTypeV) * vec_size * 8);
+  // For INT4 (DTypeV=uint8_t): sizeof(uint8_t)*16*8 = 128 bits.
+  // This loads vec_size=16 bytes per thread via cp_async.
+  // Only vec_size/2=8 bytes contain this thread's packed INT4 data;
+  // the remaining 8 bytes are the next thread's data (harmless).
+  constexpr uint32_t vec_bits_v = sizeof(DTypeV) * vec_size * 8;
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -520,10 +523,13 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   // Also reserve smem for per-group V scales (negligible: 1 half per group per tile token).
   constexpr bool int4v = is_int4_packed_v_v<DTypeV>;
   // Per-token V bytes in smem: head_dim/2 for INT4 packed, head_dim*sizeof(DTypeV) otherwise
-  constexpr size_t v_head_bytes = int4v ? (head_dim / 2) : (head_dim * sizeof(DTypeV));
+  constexpr size_t v_head_bytes = head_dim * sizeof(DTypeV);
   // Number of V elements per thread load: vec_size/2 bytes for INT4, vec_size*sizeof(DTypeV) bytes otherwise
   constexpr size_t v_vec_bytes = int4v ? (vec_size / 2) : (vec_size * sizeof(DTypeV));
-  constexpr size_t v_tile_bytes = int4v ? (kv_tile_elems / 2) : (kv_tile_elems * sizeof(DTypeV));
+  // INT4: allocate vec_size bytes per thread (not vec_size/2) to
+  // enable 128-bit cp_async. Doubles V smem vs optimal packing
+  // but enables async memory pipelining.
+  constexpr size_t v_tile_bytes = kv_tile_elems * sizeof(DTypeV);
   constexpr size_t num_tile_tokens = num_stages_smem * tile_size_per_bdx * bdy * bdz;
   // For INT4: 1 scale per group per token. group_size=128, head_dim=128 => 1 scale per token.
   // Allocate conservatively for group_size < head_dim.
@@ -574,10 +580,11 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   uint32_t stage_idx = 0;
   constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
   // INT4 packed: each byte holds 2 values, so load half the bytes per thread.
-  // INT4 V uses direct loads (not cp_async) because the packed byte
-  // width (vec_size/2 * 8 = 64 bits) is below cp_async's 128-bit minimum.
-  // For non-INT4, vec_bits_v is used by cp_async as normal.
-  constexpr uint32_t vec_bits_v = int4v ? 128 : (sizeof(DTypeV) * vec_size * 8);
+  // For INT4 (DTypeV=uint8_t): sizeof(uint8_t)*16*8 = 128 bits.
+  // This loads vec_size=16 bytes per thread via cp_async.
+  // Only vec_size/2=8 bytes contain this thread's packed INT4 data;
+  // the remaining 8 bytes are the next thread's data (harmless).
+  constexpr uint32_t vec_bits_v = sizeof(DTypeV) * vec_size * 8;
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   static_assert(num_stages_smem <= bdx);
@@ -611,18 +618,15 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       if constexpr (int4v) {
-        // INT4 packed: direct load (cp_async can't do < 128 bits)
+        // INT4 packed: cp_async loads vec_size bytes (128 bits) into
+        // padded V smem. Source is packed global array at v_offset.
         size_t v_offset_base = kv_offset[j] - tx * vec_size;
         size_t v_offset = v_offset_base / 2 + tx * (vec_size / 2);
-        uint8_t* v_smem_dst = (uint8_t*)v_smem +
-            (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * v_head_bytes +
-            tx * (vec_size / 2);
-        const uint8_t* v_src = paged_kv.v_data + v_offset;
-        bool valid = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
-#pragma unroll
-        for (uint32_t byte = 0; byte < vec_size / 2; ++byte) {
-          v_smem_dst[byte] = valid ? __ldg(v_src + byte) : 0;
-        }
+        cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+            v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+                tx * vec_size,
+            paged_kv.v_data + v_offset,
+            ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
       } else {
         cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -703,15 +707,11 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       if constexpr (int4v) {
         size_t v_offset_base = kv_offset[j] - tx * vec_size;
         size_t v_offset = v_offset_base / 2 + tx * (vec_size / 2);
-        uint8_t* v_smem_dst = (uint8_t*)v_smem +
-            (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * v_head_bytes +
-            tx * (vec_size / 2);
-        const uint8_t* v_src = paged_kv.v_data + v_offset;
-        bool valid = (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
-#pragma unroll
-        for (uint32_t byte = 0; byte < vec_size / 2; ++byte) {
-          v_smem_dst[byte] = valid ? __ldg(v_src + byte) : 0;
-        }
+        cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+            v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
+                tx * vec_size,
+            paged_kv.v_data + v_offset,
+            (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
       } else {
         cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -831,7 +831,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
           NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz * HEAD_DIM *
               sizeof(DTypeK) +
           NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz *
-              (is_int4_packed_v_v<DTypeV> ? (HEAD_DIM / 2) : (HEAD_DIM * sizeof(DTypeV))) +
+              HEAD_DIM * sizeof(DTypeV) +
           (is_int4_packed_v_v<DTypeV> ?
               (NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * (HEAD_DIM / 32) * sizeof(half)) : 0) +
           2U * bdy * bdz * sizeof(float);
@@ -932,8 +932,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
           NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM *
               sizeof(DTypeK) +
           NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz *
-              (is_int4_packed_v_v<DTypeV> ? (HEAD_DIM / 2) : (HEAD_DIM * sizeof(DTypeV))) +
-          // INT4 v_scales smem: num_tile_tokens * (head_dim/group_size) * sizeof(half)
+              HEAD_DIM * sizeof(DTypeV) +
+          // INT4 v_scales smem
           (is_int4_packed_v_v<DTypeV> ?
               (NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * (HEAD_DIM / 32) * sizeof(half)) : 0) +
           std::max(tile_size_per_bdx * num_threads * sizeof(size_t),
