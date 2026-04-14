@@ -348,9 +348,13 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 
   // preload k tiles and v tiles
   uint32_t producer_kv_idx_base = chunk_start;
+  constexpr bool int4v = is_int4_packed_v_v<DTypeV>;
   constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
   // INT4 packed: each byte holds 2 values, so load half the bytes per thread.
-  constexpr uint32_t vec_bits_v = int4v ? std::max(128u, vec_size / 2 * 8) : (sizeof(DTypeV) * vec_size * 8);
+  // INT4 V uses direct loads (not cp_async) because the packed byte
+  // width (vec_size/2 * 8 = 64 bits) is below cp_async's 128-bit minimum.
+  // For non-INT4, vec_bits_v is used by cp_async as normal.
+  constexpr uint32_t vec_bits_v = int4v ? 128 : (sizeof(DTypeV) * vec_size * 8);
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -570,7 +574,10 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   uint32_t stage_idx = 0;
   constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
   // INT4 packed: each byte holds 2 values, so load half the bytes per thread.
-  constexpr uint32_t vec_bits_v = int4v ? std::max(128u, vec_size / 2 * 8) : (sizeof(DTypeV) * vec_size * 8);
+  // INT4 V uses direct loads (not cp_async) because the packed byte
+  // width (vec_size/2 * 8 = 64 bits) is below cp_async's 128-bit minimum.
+  // For non-INT4, vec_bits_v is used by cp_async as normal.
+  constexpr uint32_t vec_bits_v = int4v ? 128 : (sizeof(DTypeV) * vec_size * 8);
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   static_assert(num_stages_smem <= bdx);
@@ -604,14 +611,18 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       if constexpr (int4v) {
-        // INT4 packed: load head_dim/2 bytes per token, adjust source offset
-        size_t v_offset_base = kv_offset[j] - tx * vec_size;  // strip tx*vec_size (K-sized)
-        size_t v_offset = v_offset_base / 2 + tx * (vec_size / 2);  // half for packing
-        cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
-            (DTypeV*)((uint8_t*)v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * v_head_bytes +
-                tx * (vec_size / 2)),
-            paged_kv.v_data + v_offset,
-            ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+        // INT4 packed: direct load (cp_async can't do < 128 bits)
+        size_t v_offset_base = kv_offset[j] - tx * vec_size;
+        size_t v_offset = v_offset_base / 2 + tx * (vec_size / 2);
+        uint8_t* v_smem_dst = (uint8_t*)v_smem +
+            (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * v_head_bytes +
+            tx * (vec_size / 2);
+        const uint8_t* v_src = paged_kv.v_data + v_offset;
+        bool valid = ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+#pragma unroll
+        for (uint32_t byte = 0; byte < vec_size / 2; ++byte) {
+          v_smem_dst[byte] = valid ? __ldg(v_src + byte) : 0;
+        }
       } else {
         cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -692,11 +703,15 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
       if constexpr (int4v) {
         size_t v_offset_base = kv_offset[j] - tx * vec_size;
         size_t v_offset = v_offset_base / 2 + tx * (vec_size / 2);
-        cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
-            (DTypeV*)((uint8_t*)v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * v_head_bytes +
-                tx * (vec_size / 2)),
-            paged_kv.v_data + v_offset,
-            (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+        uint8_t* v_smem_dst = (uint8_t*)v_smem +
+            (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * v_head_bytes +
+            tx * (vec_size / 2);
+        const uint8_t* v_src = paged_kv.v_data + v_offset;
+        bool valid = (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size;
+#pragma unroll
+        for (uint32_t byte = 0; byte < vec_size / 2; ++byte) {
+          v_smem_dst[byte] = valid ? __ldg(v_src + byte) : 0;
+        }
       } else {
         cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
             v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
@@ -797,11 +812,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   // the 128-bit minimum.  Using the smaller of the two element sizes
   // ensures both meet the bound.
   constexpr size_t min_kv_sizeof = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
-  // INT4 packed: each byte holds 2 values, so min cp_async (128 bits = 16 bytes)
-  // loads 32 INT4 values. vec_size must be >= 32 for INT4 to ensure
-  // vec_size/2 bytes >= 16 bytes per cp_async load.
-  constexpr size_t cp_async_min_elems = is_int4_packed_v_v<DTypeV> ? 32UL : 16UL;
-  constexpr uint32_t vec_size = std::max(cp_async_min_elems / min_kv_sizeof, HEAD_DIM / 32UL);
+  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   auto compute_capacity = GetCudaComputeCapability();
   static_assert(bdx <= 32U);
@@ -899,11 +910,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   //   sizeof(DType) * vec_size * 8 >= 128  =>  vec_size >= 16 / sizeof(DType).
   // Using the smaller of the two element sizes ensures both meet the bound.
   constexpr size_t min_kv_sizeof = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
-  // INT4 packed: each byte holds 2 values, so min cp_async (128 bits = 16 bytes)
-  // loads 32 INT4 values. vec_size must be >= 32 for INT4 to ensure
-  // vec_size/2 bytes >= 16 bytes per cp_async load.
-  constexpr size_t cp_async_min_elems = is_int4_packed_v_v<DTypeV> ? 32UL : 16UL;
-  constexpr uint32_t vec_size = std::max(cp_async_min_elems / min_kv_sizeof, HEAD_DIM / 32UL);
+  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
