@@ -187,23 +187,33 @@ __device__ __forceinline__ void update_local_state_int4v(
     uint32_t tx,
     uint32_t head_dim,
     uint32_t group_size) {
+  const uint32_t num_groups = head_dim / group_size;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
-    // Each thread handles vec_size logical elements.
-    // In packed format, vec_size/2 bytes encode vec_size INT4 values.
-    const uint32_t packed_offset = (j * bdx + tx) * (vec_size / 2);
+    const uint32_t packed_byte_offset = (j * bdx + tx) * (vec_size / 2);
     const uint32_t elem_base = tx * vec_size;
+    // Process vec_size/2 packed bytes in chunks of 4 (uint32 loads).
+    // Each uint32 = 4 bytes = 8 INT4 values.
 #pragma unroll
-    for (uint32_t i = 0; i < vec_size; i += 2) {
-      uint8_t packed = v_smem_packed[packed_offset + i / 2];
-      uint32_t group_idx = (elem_base + i) / group_size;
-      // Scales layout in smem: [tile_size, num_groups_per_head]
-      uint32_t num_groups = head_dim / group_size;
+    for (uint32_t byte4 = 0; byte4 < vec_size / 2; byte4 += 4) {
+      // Single 32-bit smem load: 4 packed bytes = 8 INT4 values
+      uint32_t packed4 = *reinterpret_cast<const uint32_t*>(
+          v_smem_packed + packed_byte_offset + byte4);
+      // Per-group scale. group_size=128, head_dim=128 => 1 scale.
+      uint32_t group_idx = (elem_base + byte4 * 2) / group_size;
       float scale = __half2float(v_scales_smem[j * num_groups + group_idx]);
-      float lo, hi;
-      dequant_int4x2_to_float(packed, scale, lo, hi);
-      st.o[i]     = st.o[i]     + s[j] * lo;
-      st.o[i + 1] = st.o[i + 1] + s[j] * hi;
+      // Hoist weight * scale: one multiply for all 8 values.
+      float ws = s[j] * scale;
+      // Extract 8 nibbles + accumulate. All 8 are independent => full ILP.
+      uint32_t ob = byte4 * 2;
+      st.o[ob + 0] += ws * __int2float_rn((int)((packed4 >>  0) & 0xFu) - 8);
+      st.o[ob + 1] += ws * __int2float_rn((int)((packed4 >>  4) & 0xFu) - 8);
+      st.o[ob + 2] += ws * __int2float_rn((int)((packed4 >>  8) & 0xFu) - 8);
+      st.o[ob + 3] += ws * __int2float_rn((int)((packed4 >> 12) & 0xFu) - 8);
+      st.o[ob + 4] += ws * __int2float_rn((int)((packed4 >> 16) & 0xFu) - 8);
+      st.o[ob + 5] += ws * __int2float_rn((int)((packed4 >> 20) & 0xFu) - 8);
+      st.o[ob + 6] += ws * __int2float_rn((int)((packed4 >> 24) & 0xFu) - 8);
+      st.o[ob + 7] += ws * __int2float_rn((int)((packed4 >> 28) & 0xFu) - 8);
     }
   }
 }
