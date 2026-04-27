@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import functools
 import logging
 import math
@@ -1684,6 +1685,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
@@ -1823,6 +1826,39 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # Asymmetric K/V: if k_data_type/v_data_type omitted,
+        # both default to kv_data_type (back-compat).  When set,
+        # they may differ (e.g., k=bf16, v=fp8_e4m3).
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
+        # Fail-closed: the CUDA prefill kernel template still
+        # assumes DTypeK == DTypeV internally (prefill.cuh
+        # uses unified DTypeKV).  Until the kernel refactor
+        # lands, asymmetric prefill must not reach NVCC — a
+        # cast-based silence would let the kernel misread
+        # FP8 memory as BF16 and corrupt output silently.
+        if k_data_type != v_data_type and not os.environ.get(
+            "FLASHINFER_EXPERIMENTAL_ASYM_PREFILL"
+        ):
+            raise NotImplementedError(
+                "FlashInfer paged prefill does not yet support"
+                " asymmetric K/V dtypes: k_data_type="
+                f"{k_data_type}, v_data_type={v_data_type}. "
+                "The Python/JIT path now reaches the intended"
+                " asymmetric specialization, but prefill.cuh"
+                " still uses a unified DTypeKV internally"
+                " (e.g. line 1758: 'DTypeKV* v = params.v')."
+                " The fix is a CUDA template refactor that"
+                " splits DTypeKV into DTypeK and DTypeV with"
+                " trait-based FP8 dispatch (is_fp8<DTypeV>),"
+                " not a sizeof()-based byte-width test."
+                " Set FLASHINFER_EXPERIMENTAL_ASYM_PREFILL=1"
+                " to force JIT compile during refactor."
+            )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -1962,6 +1998,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
 
         if self._jit_module is not None:
@@ -1991,7 +2029,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend, *get_module_args,
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
 
         self._block_tables = block_tables
@@ -2208,9 +2248,29 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
-        _check_cached_qkv_data_type(
-            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
-        )
+        # Asymmetric-aware paged KV validation. No dtype relaxation.
+        # Replaces the legacy symmetric _check_cached_qkv_data_type helper
+        # which conflated K and V into a single kv_data_type and would
+        # reject BF16 K when V is FP8 (the entire point of asymmetric).
+        _exp_q = self._cached_q_data_type
+        _exp_k = getattr(self, "_cached_k_data_type", self._cached_kv_data_type)
+        _exp_v = getattr(self, "_cached_v_data_type", self._cached_kv_data_type)
+        if q.dtype != _exp_q:
+            raise ValueError(
+                "q dtype " + str(q.dtype) +
+                " != cached q_data_type " + str(_exp_q)
+            )
+        if k_cache.dtype != _exp_k:
+            raise ValueError(
+                "k_cache dtype " + str(k_cache.dtype) +
+                " != cached k_data_type " + str(_exp_k)
+            )
+        if v_cache.dtype != _exp_v:
+            raise ValueError(
+                "v_cache dtype " + str(v_cache.dtype) +
+                " != cached v_data_type " + str(_exp_v)
+            )
+        
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
             if q.numel() != self._qo_indptr_last:
@@ -2752,6 +2812,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
@@ -2889,6 +2951,39 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # Asymmetric K/V: if k_data_type/v_data_type omitted,
+        # both default to kv_data_type (back-compat).  When set,
+        # they may differ (e.g., k=bf16, v=fp8_e4m3).
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
+        # Fail-closed: the CUDA prefill kernel template still
+        # assumes DTypeK == DTypeV internally (prefill.cuh
+        # uses unified DTypeKV).  Until the kernel refactor
+        # lands, asymmetric prefill must not reach NVCC — a
+        # cast-based silence would let the kernel misread
+        # FP8 memory as BF16 and corrupt output silently.
+        if k_data_type != v_data_type and not os.environ.get(
+            "FLASHINFER_EXPERIMENTAL_ASYM_PREFILL"
+        ):
+            raise NotImplementedError(
+                "FlashInfer paged prefill does not yet support"
+                " asymmetric K/V dtypes: k_data_type="
+                f"{k_data_type}, v_data_type={v_data_type}. "
+                "The Python/JIT path now reaches the intended"
+                " asymmetric specialization, but prefill.cuh"
+                " still uses a unified DTypeKV internally"
+                " (e.g. line 1758: 'DTypeKV* v = params.v')."
+                " The fix is a CUDA template refactor that"
+                " splits DTypeKV into DTypeK and DTypeV with"
+                " trait-based FP8 dispatch (is_fp8<DTypeV>),"
+                " not a sizeof()-based byte-width test."
+                " Set FLASHINFER_EXPERIMENTAL_ASYM_PREFILL=1"
+                " to force JIT compile during refactor."
+            )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -2976,6 +3071,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
         kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
 
@@ -3022,7 +3119,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend, *get_module_args,
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
 
         if self._backend == "cutlass":
@@ -3177,9 +3276,29 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        _check_cached_qkv_data_type(
-            q, k, self._cached_q_data_type, self._cached_kv_data_type
-        )
+        # Asymmetric-aware paged KV validation. No dtype relaxation.
+        # Replaces the legacy symmetric _check_cached_qkv_data_type helper
+        # which conflated K and V into a single kv_data_type and would
+        # reject BF16 K when V is FP8 (the entire point of asymmetric).
+        _exp_q = self._cached_q_data_type
+        _exp_k = getattr(self, "_cached_k_data_type", self._cached_kv_data_type)
+        _exp_v = getattr(self, "_cached_v_data_type", self._cached_kv_data_type)
+        if q.dtype != _exp_q:
+            raise ValueError(
+                "q dtype " + str(q.dtype) +
+                " != cached q_data_type " + str(_exp_q)
+            )
+        if k.dtype != _exp_k:
+            raise ValueError(
+                "k_cache dtype " + str(k.dtype) +
+                " != cached k_data_type " + str(_exp_k)
+            )
+        if k.dtype != _exp_v:
+            raise ValueError(
+                "v_cache dtype " + str(k.dtype) +
+                " != cached v_data_type " + str(_exp_v)
+            )
+        
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
             if q.numel() != self._qo_indptr_last:
