@@ -72,14 +72,20 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
   }
 }
 
+// FI-2: side-specific dtypes for K and V shared-memory regions.  When
+// DTypeK == DTypeV (the symmetric/back-compat case) the byte layout is
+// bit-identical to before this commit.  When they differ (FI-3 onward,
+// e.g., BF16 K + FP8 V), `k_smem` allocates BF16-sized slots and
+// `v_smem` allocates FP8-sized slots.
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
-          uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO>
+          uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
+          typename DTypeK = DTypeKV, typename DTypeV = DTypeKV>
 struct SharedStorageQKVO {
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
-      alignas(16) DTypeKV k_smem[CTA_TILE_KV * HEAD_DIM_QK];
-      alignas(16) DTypeKV v_smem[CTA_TILE_KV * HEAD_DIM_VO];
+      alignas(16) DTypeK k_smem[CTA_TILE_KV * HEAD_DIM_QK];
+      alignas(16) DTypeV v_smem[CTA_TILE_KV * HEAD_DIM_VO];
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
       alignas(
@@ -152,8 +158,12 @@ struct KernelTraits {
             (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
   }
 
+  // FI-2: thread DTypeK / DTypeV through the shared-storage instance
+  // so the K and V regions size themselves on the side-specific
+  // dtype.  Today both equal DTypeKV; FI-3 will let them diverge.
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
-                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
+                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
+                                          DTypeK, DTypeV>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -1618,6 +1628,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                                cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // FI-2: side-specific aliases for shared-memory byte sizing.
+  // Today equal to DTypeKV; FI-3 will let them diverge.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
   using DTypeO = typename Params::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
@@ -1652,9 +1666,15 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
         &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
     // we expect each sm execute two threadblocks
+    // FI-2: split K-half and V-half byte sizing so asym K/V dtypes
+    // size their shared-memory regions correctly.  Bit-identical to
+    // the old `(HEAD_DIM_QK + HEAD_DIM_VO) * sizeof(DTypeKV)` formula
+    // when DTypeK == DTypeV.
     const int num_ctas_per_sm =
-        max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                                (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+        max_smem_per_sm >=
+        2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+             (HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 *
+                 NUM_WARPS_KV)
             ? 2
             : 1;
     const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
@@ -1666,7 +1686,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
             : (8 / NUM_MMA_Q);
     const uint32_t max_num_mma_kv_smem =
         (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
-        ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
+        ((HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 * NUM_WARPS_KV);
 
     // control NUM_MMA_KV for maximum warp occupancy
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
@@ -2462,6 +2482,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                                                     cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // FI-2: side-specific aliases for shared-memory byte sizing.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
   using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
@@ -2490,9 +2513,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
   // we expect each sm execute two threadblocks
+  // FI-2: split K-half and V-half byte sizing.
   const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+      max_smem_per_sm >=
+      2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+           (HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 *
+               NUM_WARPS_KV)
           ? 2
           : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
@@ -2504,7 +2530,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
           : (8 / NUM_MMA_Q);
   const uint32_t max_num_mma_kv_smem =
       (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
-      ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
+      ((HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 * NUM_WARPS_KV);
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
@@ -2587,6 +2613,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  // FI-2: side-specific aliases for shared-memory byte sizing.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
   using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
@@ -2616,9 +2645,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
   // we expect each sm execute two threadblocks
+  // FI-2: split K-half and V-half byte sizing.
   const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+      max_smem_per_sm >=
+      2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+           (HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 *
+               NUM_WARPS_KV)
           ? 2
           : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
@@ -2630,7 +2662,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
           : (8 / NUM_MMA_Q);
   const uint32_t max_num_mma_kv_smem =
       (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
-      ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
+      ((HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 * NUM_WARPS_KV);
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
