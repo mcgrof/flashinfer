@@ -122,11 +122,12 @@ struct KernelTraits {
   static constexpr uint32_t HEAD_DIM_QK = NUM_MMA_D_QK * 16;
   static constexpr uint32_t HEAD_DIM_VO = NUM_MMA_D_VO * 16;
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
-  // FI-1: K-side / V-side stride keyed on the side-specific dtype
-  // alias.  Today both aliases point at DTypeKV_; FI-3 will let them
-  // diverge.  Naming K and V differently here is the no-op rename.
+  // FI-4: K-side stride uses DTypeKV_ (which carries the K dtype as
+  // the legacy template name); V-side stride uses the now-independent
+  // DTypeV_.  When DTypeV_ defaults to DTypeKV_ (symmetric), both
+  // strides remain identical — bit-compatible with pre-asym kernels.
   static constexpr uint32_t UPCAST_STRIDE_K = HEAD_DIM_QK / upcast_size<DTypeKV_>();
-  static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeKV_>();
+  static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeV_>();
   static constexpr uint32_t UPCAST_STRIDE_O = HEAD_DIM_VO / upcast_size<DTypeO_>();
   static constexpr uint32_t CTA_TILE_Q = CTA_TILE_Q_;
   static constexpr uint32_t CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16;
