@@ -111,6 +111,9 @@ struct KernelTraits {
   static constexpr uint32_t HEAD_DIM_QK = NUM_MMA_D_QK * 16;
   static constexpr uint32_t HEAD_DIM_VO = NUM_MMA_D_VO * 16;
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
+  // FI-1: K-side / V-side stride keyed on the side-specific dtype
+  // alias.  Today both aliases point at DTypeKV_; FI-3 will let them
+  // diverge.  Naming K and V differently here is the no-op rename.
   static constexpr uint32_t UPCAST_STRIDE_K = HEAD_DIM_QK / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_O = HEAD_DIM_VO / upcast_size<DTypeO_>();
@@ -125,6 +128,16 @@ struct KernelTraits {
   static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
+  // Asymmetric K/V (Path 3 staged refactor): `DTypeK` and `DTypeV` are
+  // semantic aliases over the still-unified `DTypeKV`.  Rename
+  // K-specific and V-specific call sites to use these aliases as the
+  // refactor progresses; behavior is bit-identical while
+  // `DTypeK == DTypeV == DTypeKV`.  When the template signature is
+  // split (FI-3), these will become independent template parameters
+  // and the call sites already using the side-specific alias will
+  // automatically pick up the right type.
+  using DTypeK = DTypeKV_;
+  using DTypeV = DTypeKV_;
   using DTypeO = DTypeO_;
   using DTypeQKAccum = DTypeQKAccum_;
   using IdType = IdType_;
@@ -1342,6 +1355,13 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
   } else {
 #endif
     using DTypeKV = typename Params::DTypeKV;
+    // FI-1: K-side and V-side semantic aliases.  Today equal to
+    // DTypeKV; FI-3 will let them diverge.  The Params struct already
+    // carries DTypeK / DTypeV separately (commit 414b187), so once
+    // KernelTraits' template signature splits, these become the right
+    // types automatically.
+    using DTypeK = typename Params::DTypeK;
+    using DTypeV = typename Params::DTypeV;
     using DTypeO = typename Params::DTypeO;
     using DTypeQKAccum = typename KTraits::DTypeQKAccum;
     using AttentionVariant = typename KTraits::AttentionVariant;
@@ -1366,8 +1386,13 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
 
     DTypeQ* q = params.q;
-    DTypeKV* k = params.k;
-    DTypeKV* v = params.v;
+    // FI-1: K-side / V-side pointer types use the side-specific
+    // alias.  In Params, DTypeK and DTypeV are independent template
+    // parameters (default V = K for backward compat), so this rename
+    // already picks up the right pointer type from Params even before
+    // KernelTraits' template signature is split.
+    DTypeK* k = params.k;
+    DTypeV* v = params.v;
     DTypeO* o = params.o;
     float* lse = params.lse;
     const uint32_t qo_len = params.qo_len;
@@ -1455,14 +1480,17 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
              : chunk_size) /
         CTA_TILE_KV;
 
-    DTypeKV* k_ptr =
+    // FI-1: K-side / V-side pointer offsets keyed on the side-specific
+    // dtype.  upcast_size<> picks element-count granularity off the
+    // dtype size; for asym K=BF16 V=FP8 these will differ in FI-3+.
+    DTypeK* k_ptr =
         k +
         (chunk_start + warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL) * k_stride_n +
-        kv_head_idx * k_stride_h + (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
-    DTypeKV* v_ptr =
+        kv_head_idx * k_stride_h + (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeK>();
+    DTypeV* v_ptr =
         v +
         (chunk_start + warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL) * v_stride_n +
-        kv_head_idx * v_stride_h + (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
+        kv_head_idx * v_stride_h + (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeV>();
 
     uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                  get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -1724,6 +1752,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
   } else {
 #endif
     using DTypeKV = typename Params::DTypeKV;
+    // FI-1: K-side and V-side aliases.  See SinglePrefill for the
+    // refactor stage rationale.
+    using DTypeK = typename Params::DTypeK;
+    using DTypeV = typename Params::DTypeV;
     using DTypeO = typename Params::DTypeO;
     using IdType = typename Params::IdType;
     using DTypeQKAccum = typename KTraits::DTypeQKAccum;
@@ -1754,8 +1786,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     IdType* kv_tile_indices = params.kv_tile_indices;
     IdType* q_indptr = params.q_indptr;
     IdType* kv_indptr = params.kv_indptr;
-    DTypeKV* k = params.k;
-    DTypeKV* v = params.v;
+    DTypeK* k = params.k;
+    DTypeV* v = params.v;
     IdType* o_indptr = params.o_indptr;
     DTypeO* o = params.o;
     float* lse = params.lse;
@@ -1896,18 +1928,20 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                  warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                  lane_idx % KV_THR_LAYOUT_COL);
 
-    DTypeKV* k_ptr = k +
+    // FI-1: K-side / V-side pointer offsets keyed on the side-specific
+    // dtype.  See SinglePrefill above for rationale.
+    DTypeK* k_ptr = k +
                      (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
                       lane_idx / KV_THR_LAYOUT_COL) *
                          k_stride_n +
                      kv_head_idx * k_stride_h +
-                     (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
-    DTypeKV* v_ptr = v +
+                     (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeK>();
+    DTypeV* v_ptr = v +
                      (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
                       lane_idx / KV_THR_LAYOUT_COL) *
                          v_stride_n +
                      kv_head_idx * v_stride_h +
-                     (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
+                     (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeV>();
 
     produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                            k_stride_n, 0, chunk_size, tid);
