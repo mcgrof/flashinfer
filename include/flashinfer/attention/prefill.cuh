@@ -98,11 +98,16 @@ struct SharedStorageQKVO {
   };
 };
 
+// FI-3: split K and V dtypes as independent template parameters.
+// `DTypeV_` defaults to `DTypeKV_` so every existing symmetric
+// instantiation continues to compile with no changes — including the
+// JIT-generated code paths that don't yet supply DTypeV explicitly.
+// Asymmetric callers (BF16 K + FP8 V) pass `DTypeV_` separately.
 template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_,
           uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
           uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
-          typename AttentionVariant_>
+          typename AttentionVariant_, typename DTypeV_ = DTypeKV_>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
@@ -133,17 +138,16 @@ struct KernelTraits {
   static constexpr uint32_t KV_THR_LAYOUT_COL = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 8 : 4;
   static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
   using DTypeQ = DTypeQ_;
+  // FI-3: K and V dtypes are now independent template parameters.
+  // `DTypeKV` is retained as a back-compat alias equal to `DTypeK`
+  // (the legacy template parameter `DTypeKV_` is still named that
+  // way to avoid churn at every instantiation site, and it carries
+  // the K dtype).  When `DTypeV_` is not supplied at instantiation,
+  // it defaults to `DTypeKV_` and the kernel behaves identically
+  // to the pre-asym implementation.
   using DTypeKV = DTypeKV_;
-  // Asymmetric K/V (Path 3 staged refactor): `DTypeK` and `DTypeV` are
-  // semantic aliases over the still-unified `DTypeKV`.  Rename
-  // K-specific and V-specific call sites to use these aliases as the
-  // refactor progresses; behavior is bit-identical while
-  // `DTypeK == DTypeV == DTypeKV`.  When the template signature is
-  // split (FI-3), these will become independent template parameters
-  // and the call sites already using the side-specific alias will
-  // automatically pick up the right type.
   using DTypeK = DTypeKV_;
-  using DTypeV = DTypeKV_;
+  using DTypeV = DTypeV_;
   using DTypeO = DTypeO_;
   using DTypeQKAccum = DTypeQKAccum_;
   using IdType = IdType_;
@@ -1690,10 +1694,14 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
     // control NUM_MMA_KV for maximum warp occupancy
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
+      // FI-3: pass DTypeV explicitly so asym variants instantiate with
+      // the V dtype distinct from K.  Symmetric callers have
+      // Params::DTypeV == DTypeKV so this is bit-identical for them.
       using KTraits =
           KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                        NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                       DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+                       DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                       DTypeV>;
       if constexpr (KTraits::IsInvalid()) {
         // Invalid configuration, skip
         std::ostringstream err_msg;
@@ -2534,9 +2542,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
+        // FI-3: pass DTypeV explicitly for asym variants.  Symmetric
+        // callers have Params::DTypeV == DTypeKV so this is bit-identical.
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                      NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+                     DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                     DTypeV>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
@@ -2666,9 +2677,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
+        // FI-3: pass DTypeV explicitly for asym variants.  Symmetric
+        // callers have Params::DTypeV == DTypeKV so this is bit-identical.
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                      NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+                     DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                     DTypeV>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
