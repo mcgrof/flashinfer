@@ -124,8 +124,11 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         RaggedParams params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
-        params.k = static_cast<DTypeKV*>(k.data_ptr());
-        params.v = static_cast<DTypeKV*>(v.data_ptr());
+        // Asymmetric K/V: RaggedParams::DTypeV may differ from DTypeKV
+        // (which is fixed to DTypeK by the dispatcher).  Use the
+        // params' own typedefs to avoid a static_cast type mismatch.
+        params.k = static_cast<typename RaggedParams::DTypeK*>(k.data_ptr());
+        params.v = static_cast<typename RaggedParams::DTypeV*>(v.data_ptr());
         params.o = static_cast<DTypeO*>(o.data_ptr());
         params.lse =
             maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
@@ -256,10 +259,16 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         PagedParams params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
-        paged_kv_t<DTypeKV, IdType> paged_kv(
+        // Asymmetric K/V: instantiate paged_kv_t with distinct DTypeK
+        // and DTypeV from PagedParams; the dispatcher's DTypeKV is
+        // fixed to DTypeK so reusing it for V would mistype the
+        // V tensor pointer.
+        using _DTypeK = typename PagedParams::DTypeK;
+        using _DTypeV = typename PagedParams::DTypeV;
+        paged_kv_t<_DTypeK, IdType, _DTypeV> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,
-            static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-            static_cast<DTypeKV*>(paged_v_cache.data_ptr()),
+            static_cast<_DTypeK*>(paged_k_cache.data_ptr()),
+            static_cast<_DTypeV*>(paged_v_cache.data_ptr()),
             k_cache_strides, v_cache_strides,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
