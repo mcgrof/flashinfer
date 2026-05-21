@@ -21,6 +21,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 #include "../cp_async.cuh"
 #include "../fastdiv.cuh"
@@ -73,13 +74,20 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 }
 
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
-          uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO>
+          uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
+          typename DTypeV = DTypeKV>
 struct SharedStorageQKVO {
+  // Asymmetric K/V: V smem element type may differ from K's (e.g. K
+  // stays at bf16 while V is fp8 in HBM and remains at fp8 in smem;
+  // the per-element conversion to DTypeQ happens in registers in
+  // compute_sfm_v on the way to the MMA op).  Symmetric callers pass
+  // only DTypeKV and DTypeV defaults to it, so the layout is identical
+  // to the pre-asymmetric one.
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
       alignas(16) DTypeKV k_smem[CTA_TILE_KV * HEAD_DIM_QK];
-      alignas(16) DTypeKV v_smem[CTA_TILE_KV * HEAD_DIM_VO];
+      alignas(16) DTypeV v_smem[CTA_TILE_KV * HEAD_DIM_VO];
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
       alignas(
@@ -96,7 +104,7 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
           uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
-          typename AttentionVariant_>
+          typename AttentionVariant_, typename DTypeV_ = DTypeKV_>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
@@ -112,19 +120,32 @@ struct KernelTraits {
   static constexpr uint32_t HEAD_DIM_VO = NUM_MMA_D_VO * 16;
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_K = HEAD_DIM_QK / upcast_size<DTypeKV_>();
-  static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeKV_>();
+  // Asymmetric K/V: V smem upcast stride keys off V's dtype.  For
+  // symmetric callers DTypeV_ == DTypeKV_ so this matches the original
+  // formula and there is no JIT cache churn.
+  static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeV_>();
   static constexpr uint32_t UPCAST_STRIDE_O = HEAD_DIM_VO / upcast_size<DTypeO_>();
   static constexpr uint32_t CTA_TILE_Q = CTA_TILE_Q_;
   static constexpr uint32_t CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16;
 
   static constexpr SwizzleMode SWIZZLE_MODE_Q = SwizzleMode::k128B;
+  // The k64B swizzle was added specifically for FP8 KV at head_dim 64
+  // (sizeof == 1).  In asymmetric mode it's the V side that goes FP8,
+  // so trigger the same swizzle when either K or V is single-byte.
   static constexpr SwizzleMode SWIZZLE_MODE_KV =
-      (sizeof(DTypeKV_) == 1 && HEAD_DIM_VO == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
+      ((sizeof(DTypeKV_) == 1 || sizeof(DTypeV_) == 1) && HEAD_DIM_VO == 64)
+          ? SwizzleMode::k64B
+          : SwizzleMode::k128B;
   static constexpr uint32_t KV_THR_LAYOUT_ROW = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 4 : 8;
   static constexpr uint32_t KV_THR_LAYOUT_COL = SWIZZLE_MODE_KV == SwizzleMode::k128B ? 8 : 4;
   static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
+  // Asymmetric K/V: explicit per-side aliases. DTypeK == DTypeKV always
+  // (the existing dispatcher uses DTypeKV for the K side).  DTypeV
+  // defaults to DTypeKV so symmetric callers see no change.
+  using DTypeK = DTypeKV_;
+  using DTypeV = DTypeV_;
   using DTypeO = DTypeO_;
   using DTypeQKAccum = DTypeQKAccum_;
   using IdType = IdType_;
@@ -139,8 +160,13 @@ struct KernelTraits {
             (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
   }
 
+  // Asymmetric K/V: SharedStorageQKVO now takes a separate DTypeV (the
+  // fourth-to-last template parameter, defaulting to DTypeKV so
+  // symmetric callers are unchanged).  V smem element size matches the
+  // V cp.async stride and the fp8/bf16 conversion to DTypeQ is done in
+  // registers in compute_sfm_v.
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
-                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
+                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO, DTypeV>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -273,11 +299,18 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half
  */
 template <bool produce_v, SharedMemFillMode fill_mode, typename KTraits>
 __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem,
-                                           uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
+                                           uint32_t* smem_offset,
+                                           typename std::conditional<
+                                               produce_v,
+                                               typename KTraits::DTypeV,
+                                               typename KTraits::DTypeK>::type** gptr,
                                            const uint32_t stride_n, const uint32_t kv_idx_base,
                                            const uint32_t kv_len, const dim3 tid = threadIdx) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
-  using DTypeKV = typename KTraits::DTypeKV;
+  // Asymmetric K/V: stride/sizeof math uses the produce-side dtype so a
+  // bf16-K + fp8-V kernel walks K at 2 bytes per elem and V at 1.
+  using DTypeKV = typename std::conditional<produce_v, typename KTraits::DTypeV,
+                                            typename KTraits::DTypeK>::type;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
   constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
@@ -325,14 +358,20 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
 template <bool produce_v, typename KTraits>
 __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorage* smem_storage,
                                                 uint32_t* smem_offset,
-                                                typename KTraits::DTypeKV* kv_ptr,
+                                                typename std::conditional<
+                                                    produce_v,
+                                                    typename KTraits::DTypeV,
+                                                    typename KTraits::DTypeK>::type* kv_ptr,
                                                 const uint32_t kv_idx_base,
                                                 const size_t* thr_local_kv_offset,
                                                 const uint32_t kv_len, const uint32_t warp_idx,
                                                 const uint32_t lane_idx) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   smem_t<KTraits::SWIZZLE_MODE_KV> smem(produce_v ? smem_storage->v_smem : smem_storage->k_smem);
-  using DType = typename KTraits::DTypeKV;
+  // Asymmetric K/V: V and K element types may differ; pick per the
+  // template specialization (produce_v).
+  using DType = typename std::conditional<produce_v, typename KTraits::DTypeV,
+                                          typename KTraits::DTypeK>::type;
   using IdType = typename KTraits::IdType;
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
@@ -990,7 +1029,11 @@ __device__ __forceinline__ void compute_sfm_v(
 #pragma unroll
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
       uint32_t b_frag[4];
-      if constexpr (sizeof(typename KTraits::DTypeKV) == 1) {
+      // Asymmetric K/V: the V smem read path needs to key off V's
+      // dtype, not the (K-side) DTypeKV.  Otherwise an asym K=bf16,
+      // V=fp8 kernel skips the fp8 dequant branch on V and reads
+      // pairs of fp8 bytes as bf16 garbage.
+      if constexpr (sizeof(typename KTraits::DTypeV) == 1) {
         uint32_t b_frag_f8[2];
         if (mma_d % 2 == 0) {
           v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_f8);
@@ -999,8 +1042,8 @@ __device__ __forceinline__ void compute_sfm_v(
         }
         b_frag_f8[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[0]);
         b_frag_f8[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[1]);
-        vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeKV>::cast<8>(
-            (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeKV*)b_frag_f8);
+        vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeV>::cast<8>(
+            (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeV*)b_frag_f8);
         swap(b_frag[1], b_frag[2]);
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
@@ -1015,7 +1058,7 @@ __device__ __forceinline__ void compute_sfm_v(
               o_frag[mma_q][mma_d], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
         }
       }
-      if constexpr (sizeof(typename KTraits::DTypeKV) == 1) {
+      if constexpr (sizeof(typename KTraits::DTypeV) == 1) {
         if (mma_d % 2 == 1) {
           *v_smem_offset_r =
               v_smem->template advance_offset_by_column<2>(*v_smem_offset_r, mma_d / 2);
@@ -1024,9 +1067,10 @@ __device__ __forceinline__ void compute_sfm_v(
         *v_smem_offset_r = v_smem->template advance_offset_by_column<2>(*v_smem_offset_r, mma_d);
       }
     }
+    // Stride math uses V's element byte size on the V-side advance.
     *v_smem_offset_r =
         v_smem->template advance_offset_by_row<16, UPCAST_STRIDE_V>(*v_smem_offset_r) -
-        sizeof(typename KTraits::DTypeKV) * KTraits::NUM_MMA_D_VO;
+        sizeof(typename KTraits::DTypeV) * KTraits::NUM_MMA_D_VO;
   }
   *v_smem_offset_r -= 16 * KTraits::NUM_MMA_KV * UPCAST_STRIDE_V;
 }
@@ -1342,6 +1386,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
   } else {
 #endif
     using DTypeKV = typename Params::DTypeKV;
+    // Asymmetric K/V: pull V's dtype from Params; for symmetric callers
+    // it collapses to DTypeKV.
+    using DTypeV_p = typename Params::DTypeV;
     using DTypeO = typename Params::DTypeO;
     using DTypeQKAccum = typename KTraits::DTypeQKAccum;
     using AttentionVariant = typename KTraits::AttentionVariant;
@@ -1367,7 +1414,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
     DTypeQ* q = params.q;
     DTypeKV* k = params.k;
-    DTypeKV* v = params.v;
+    DTypeV_p* v = params.v;
     DTypeO* o = params.o;
     float* lse = params.lse;
     const uint32_t qo_len = params.qo_len;
@@ -1459,10 +1506,11 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         k +
         (chunk_start + warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL) * k_stride_n +
         kv_head_idx * k_stride_h + (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
-    DTypeKV* v_ptr =
+    // Asymmetric K/V: V pointer arithmetic uses V's element type.
+    DTypeV_p* v_ptr =
         v +
         (chunk_start + warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL) * v_stride_n +
-        kv_head_idx * v_stride_h + (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
+        kv_head_idx * v_stride_h + (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeV_p>();
 
     uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                  get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -1908,12 +1956,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                          k_stride_n +
                      kv_head_idx * k_stride_h +
                      (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
-    DTypeKV* v_ptr = v +
-                     (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
-                      lane_idx / KV_THR_LAYOUT_COL) *
-                         v_stride_n +
-                     kv_head_idx * v_stride_h +
-                     (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>();
+    // Asymmetric K/V: V pointer keys off V's element type, not K's.
+    typename Params::DTypeV* v_ptr =
+        v + (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
+             lane_idx / KV_THR_LAYOUT_COL) *
+                v_stride_n +
+        kv_head_idx * v_stride_h +
+        (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<typename Params::DTypeV>();
 
     produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                            k_stride_n, 0, chunk_size, tid);
