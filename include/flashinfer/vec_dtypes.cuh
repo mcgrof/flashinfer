@@ -2060,8 +2060,6 @@ FLASHINFER_INLINE vec2_dtype_t<T> get_vec2_element(vec_t<T, VEC_SIZE>& vec, int 
 
 }  // namespace flashinfer
 
-#endif  // VEC_DTYPES_CUH_
-
 // ---------- INT4 packed dequantization utilities ----------
 
 /*!
@@ -2097,4 +2095,6 @@ __device__ __forceinline__ void dequant_int4x2_to_float(
   out_lo = __int2float_rn(lo) * scale;
   out_hi = __int2float_rn(hi) * scale;
 }
+
+#endif  // VEC_DTYPES_CUH_
 
