@@ -55,6 +55,18 @@ struct paged_kv_t {
   uint32_t stride_n;
   uint32_t stride_h;
 
+  // Asymmetric K/V: when K and V tensors carry different dtypes (e.g.,
+  // K=fp16, V=fp8) backed by a shared raw allocation, the per-element
+  // stride along the page dim differs by exactly the dtype byte ratio.
+  // The symmetric kernel uses one stride for both K and V; the
+  // asymmetric kernel needs the V-side page stride too.
+  //
+  // For symmetric callers `stride_page_v == stride_page` and every
+  // existing code path remains bit-identical.
+  uint32_t stride_page_v;
+  uint32_t stride_n_v;
+  uint32_t stride_h_v;
+
   // Internal layout:
   // [max_num_pages, num_heads, page_size, head_dim] if layout == HND
   // [max_num_pages, page_size, num_heads, head_dim] if layout == NHD
@@ -93,6 +105,9 @@ struct paged_kv_t {
         stride_page(0),
         stride_n(0),
         stride_h(0),
+        stride_page_v(0),
+        stride_n_v(0),
+        stride_h_v(0),
         k_data(nullptr),
         v_data(nullptr),
         indices(nullptr),
@@ -134,6 +149,10 @@ struct paged_kv_t {
     this->v_data = v_data;
     stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
     stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
+    // Symmetric default: V strides mirror K strides.
+    stride_page_v = stride_page;
+    stride_n_v = stride_n;
+    stride_h_v = stride_h;
   }
 
   /*!
@@ -169,6 +188,42 @@ struct paged_kv_t {
     this->v_data = v_data;
     stride_n = layout == QKVLayout::kHND ? kv_strides[2] : kv_strides[1];
     stride_h = layout == QKVLayout::kHND ? kv_strides[1] : kv_strides[2];
+    // Symmetric default: V strides mirror K strides.
+    stride_page_v = stride_page;
+    stride_n_v = stride_n;
+    stride_h_v = stride_h;
+  }
+
+  /*!
+   * \brief Construct a paged key-value cache with distinct K and V strides.
+   *
+   * Used by asymmetric K/V layouts where K and V carry different element
+   * types over a shared int8 raw allocation, so their per-element strides
+   * along the page dim disagree.  Both `k_strides` and `v_strides` follow
+   * the same layout contract as the symmetric constructor's `kv_strides`.
+   */
+  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
+                                      uint32_t batch_size, QKVLayout layout, DTypeK* k_data,
+                                      DTypeV* v_data, const int64_t* k_strides,
+                                      const int64_t* v_strides, IdType* indices,
+                                      IdType* indptr, IdType* last_page_len,
+                                      IdType* rope_pos_offset = nullptr)
+      : num_heads(num_heads),
+        page_size(page_size),
+        head_dim(head_dim),
+        batch_size(batch_size),
+        indices(indices),
+        indptr(indptr),
+        last_page_len(last_page_len),
+        rope_pos_offset(rope_pos_offset) {
+    this->k_data = k_data;
+    this->v_data = v_data;
+    stride_page = k_strides[0];
+    stride_n = layout == QKVLayout::kHND ? k_strides[2] : k_strides[1];
+    stride_h = layout == QKVLayout::kHND ? k_strides[1] : k_strides[2];
+    stride_page_v = v_strides[0];
+    stride_n_v = layout == QKVLayout::kHND ? v_strides[2] : v_strides[1];
+    stride_h_v = layout == QKVLayout::kHND ? v_strides[1] : v_strides[2];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
@@ -189,6 +244,19 @@ struct paged_kv_t {
                                                              size_t entry_idx,
                                                              size_t feat_idx) const {
     return page_idx * stride_page + head_idx * stride_h + entry_idx * stride_n + feat_idx;
+  }
+
+  /*!
+   * \brief Compute the offset of an element in the V-side allocated buffer.
+   *
+   * Uses the V-side strides.  For symmetric callers this returns the same
+   * value as `get_elem_offset`; for asymmetric K/V the per-element stride
+   * along the page dim differs and this returns the correct V offset.
+   */
+  __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
+                                                               size_t entry_idx,
+                                                               size_t feat_idx) const {
+    return page_idx * stride_page_v + head_idx * stride_h_v + entry_idx * stride_n_v + feat_idx;
   }
 
   /*!
@@ -218,6 +286,21 @@ struct paged_kv_t {
     }
   }
 
+  /*!
+   * \brief Protective V-side offset accessor.  Mirrors
+   * `protective_get_kv_offset` but uses V strides so asymmetric K/V layouts
+   * dereference V correctly.  Symmetric callers see the same value.
+   */
+  __device__ __forceinline__ size_t protective_get_v_offset(IdType page_iter, uint32_t head_idx,
+                                                            uint32_t entry_idx, uint32_t feat_idx,
+                                                            IdType last_indptr) const {
+    if (page_iter < last_indptr) {
+      return get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    } else {
+      return 0;
+    }
+  }
+
   __device__ __forceinline__ DTypeK* protective_get_k_ptr(IdType page_iter, uint32_t head_idx,
                                                           uint32_t entry_idx, uint32_t feat_idx,
                                                           IdType last_indptr) const {
@@ -226,13 +309,13 @@ struct paged_kv_t {
 
   __device__ __forceinline__ DTypeV* get_v_ptr(IdType page_iter, uint32_t head_idx,
                                                uint32_t entry_idx, uint32_t feat_idx) const {
-    return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    return v_data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
   }
 
   __device__ __forceinline__ DTypeV* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
                                                           uint32_t entry_idx, uint32_t feat_idx,
                                                           IdType last_indptr) const {
-    return v_data + protective_get_kv_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
+    return v_data + protective_get_v_offset(page_iter, head_idx, entry_idx, feat_idx, last_indptr);
   }
 };
 

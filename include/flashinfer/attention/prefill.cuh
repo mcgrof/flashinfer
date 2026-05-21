@@ -2171,7 +2171,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     }
 
     smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
+    // Asymmetric K/V: K and V need independent offset arrays because
+    // their per-element page strides may differ.  For symmetric layouts
+    // the two arrays end up bit-identical.
     size_t thr_local_kv_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
+    size_t thr_local_v_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
 
     uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                  get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -2200,12 +2204,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       thr_local_kv_offset[i] = paged_kv.protective_get_kv_offset(
           page_iter, kv_head_idx, entry_idx,
           (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
+      thr_local_v_offset[i] = paged_kv.protective_get_v_offset(
+          page_iter, kv_head_idx, entry_idx,
+          (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
     }
     page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data, 0,
                                     thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
     cp_async::commit_group();
     page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
-                                   thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+                                   thr_local_v_offset, chunk_size, warp_idx, lane_idx);
     cp_async::commit_group();
 
     uint32_t num_iterations_prefix;
@@ -2284,6 +2291,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         thr_local_kv_offset[i] = paged_kv.protective_get_kv_offset(
             page_iter, kv_head_idx, entry_idx,
             (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
+        thr_local_v_offset[i] = paged_kv.protective_get_v_offset(
+            page_iter, kv_head_idx, entry_idx,
+            (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
       }
       cp_async::wait_group<1>();
       block.sync();
@@ -2349,7 +2359,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       block.sync();
       page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                     (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
+                                     (iter + 1) * CTA_TILE_KV, thr_local_v_offset, chunk_size,
                                      warp_idx, lane_idx);
       cp_async::commit_group();
     }

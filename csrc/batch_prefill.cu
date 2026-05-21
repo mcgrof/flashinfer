@@ -239,13 +239,12 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
 
-  // get kv_cache_strides
-  const int64_t* kv_cache_strides = paged_k_cache.strides().data();
+  // get kv_cache_strides — K and V may carry distinct per-element strides
+  // when the asymmetric layout backs them with one int8 raw allocation
+  // (e.g. fp16 K + fp8 V).  The kernel uses them independently.
+  const int64_t* k_cache_strides = paged_k_cache.strides().data();
+  const int64_t* v_cache_strides = paged_v_cache.strides().data();
   TVM_FFI_ICHECK_EQ(paged_k_cache.ndim(), paged_v_cache.ndim());
-  for (int i = 0; i < paged_k_cache.ndim(); ++i) {
-    TVM_FFI_ICHECK_EQ(paged_k_cache.stride(i), paged_v_cache.stride(i))
-        << "k/v strides differs at " << i;
-  }
 
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
@@ -260,7 +259,8 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,
             static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+            static_cast<DTypeKV*>(paged_v_cache.data_ptr()),
+            k_cache_strides, v_cache_strides,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));

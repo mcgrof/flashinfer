@@ -129,13 +129,14 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
 
-  // get kv_cache_strides
-  const int64_t* kv_cache_strides = nullptr;
+  // get kv_cache_strides — K and V may carry distinct per-element strides
+  // when the asymmetric layout backs them with one int8 raw allocation
+  // (e.g. fp16 K + fp8 V).  The kernel uses them independently.
   auto k_strides = paged_k_cache.strides();
   auto v_strides = paged_v_cache.strides();
   TVM_FFI_ICHECK_EQ(k_strides.size(), v_strides.size());
-  // INT4 packed V may have different strides; use K strides as canonical.
-  kv_cache_strides = k_strides.data();
+  const int64_t* k_cache_strides = k_strides.data();
+  const int64_t* v_cache_strides = v_strides.data();
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
@@ -146,7 +147,8 @@ void BatchDecodeWithPagedKVCacheRun(TensorView float_workspace_buffer,
         paged_kv_t<DTypeK, IdType, DTypeV> paged_kv(
             num_kv_heads, page_size, HEAD_DIM_QK, batch_size, kv_layout,
             static_cast<DTypeK*>(paged_k_cache.data_ptr()),
-            static_cast<DTypeV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+            static_cast<DTypeV*>(paged_v_cache.data_ptr()),
+            k_cache_strides, v_cache_strides,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
