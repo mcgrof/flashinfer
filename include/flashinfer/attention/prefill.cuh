@@ -1754,8 +1754,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     IdType* kv_tile_indices = params.kv_tile_indices;
     IdType* q_indptr = params.q_indptr;
     IdType* kv_indptr = params.kv_indptr;
-    DTypeKV* k = params.k;
-    DTypeKV* v = params.v;
+    // Asymmetric K/V: pull K and V dtypes from the Params struct so the
+    // kernel accepts distinct K/V element types (e.g. K=bf16, V=fp8).
+    // Symmetric Params have Params::DTypeK == Params::DTypeV == DTypeKV
+    // so this is a bit-identical change for existing callers.
+    using DTypeK_local = typename Params::DTypeK;
+    using DTypeV_local = typename Params::DTypeV;
+    DTypeK_local* k = params.k;
+    DTypeV_local* v = params.v;
     IdType* o_indptr = params.o_indptr;
     DTypeO* o = params.o;
     float* lse = params.lse;
@@ -2066,7 +2072,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     DTypeO* o = params.o;
     float* lse = params.lse;
     bool* block_valid_mask = params.block_valid_mask;
-    const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
+    // Asymmetric K/V: paged_kv_t carries distinct K and V dtypes via
+    // the third template parameter; in symmetric mode DTypeV == DTypeK
+    // and this reduces to the original paged_kv_t<DTypeKV, IdType>.
+    const paged_kv_t<typename Params::DTypeK, IdType,
+                     typename Params::DTypeV>& paged_kv = params.paged_kv;
     const bool partition_kv = params.partition_kv;
     const uint_fastdiv& group_size = params.group_size;
 
