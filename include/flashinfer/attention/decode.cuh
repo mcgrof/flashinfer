@@ -218,15 +218,8 @@ template <PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t 
 __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
-  // Asymmetric K/V plumbing. For now DTypeK must equal DTypeV because this
-  // kernel body's shared-memory layout and load vectorization assume a
-  // single KV element size. The plumbing is in place for the follow-up
-  // commit that splits the K and V load paths.
   using DTypeK = typename Params::DTypeK;
   using DTypeV = typename Params::DTypeV;
-  static_assert(std::is_same_v<DTypeK, DTypeV>,
-                "SingleDecodeWithKVCacheKernel does not yet support asymmetric "
-                "K/V dtypes; see the upstream asymmetric-kv-dtype patch plan");
   using DTypeO = typename Params::DTypeO;
   const DTypeQ* q = params.q;
   const DTypeK* k = params.k;
@@ -248,14 +241,20 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   uint32_t kv_chunk_idx = blockIdx.x;
   uint32_t num_qo_heads = params.num_qo_heads;
 
+  // Asymmetric K/V: K and V tiles may have different byte sizes per element.
+  // k_smem stores K data typed as DTypeK; v_smem stores V data typed as DTypeV.
+  // When DTypeK == DTypeV (the symmetric case), the layout is byte-identical
+  // to the pre-asymmetric code.
+  constexpr size_t kv_tile_elems = num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim;
+  constexpr size_t k_tile_bytes = kv_tile_elems * sizeof(DTypeK);
+  constexpr size_t v_tile_bytes = kv_tile_elems * sizeof(DTypeV);
+
   extern __shared__ uint8_t smem[];
   AttentionVariant variant(params, /*batch_idx=*/0, smem);
   const uint32_t seq_len = variant.kv_len;
-  DTypeKV* k_smem = (DTypeKV*)smem;
-  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                          sizeof(DTypeKV));
-  float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                       sizeof(DTypeKV));
+  DTypeK* k_smem = (DTypeK*)smem;
+  DTypeV* v_smem = (DTypeV*)(smem + k_tile_bytes);
+  float* smem_md = (float*)(smem + k_tile_bytes + v_tile_bytes);
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -285,11 +284,12 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 
   // preload k tiles and v tiles
   uint32_t producer_kv_idx_base = chunk_start;
-  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
+  constexpr uint32_t vec_bits_k = sizeof(DTypeK) * vec_size * 8;
+  constexpr uint32_t vec_bits_v = sizeof(DTypeV) * vec_size * 8;
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      cp_async::pred_load<vec_bits_k, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           k + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
@@ -298,7 +298,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     }
     cp_async::commit_group();
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+      cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           v + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
@@ -327,7 +327,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+      cp_async::pred_load<vec_bits_k, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           k + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
@@ -346,7 +346,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 
     // load v
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+      cp_async::pred_load<vec_bits_v, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
           v + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
@@ -679,31 +679,35 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
                                               cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
-  // Asymmetric K/V plumbing; body still requires equal K and V dtypes.
   using DTypeK = typename Params::DTypeK;
   using DTypeV = typename Params::DTypeV;
-  static_assert(std::is_same_v<DTypeK, DTypeV>,
-                "SingleDecodeWithKVCacheDispatched does not yet support "
-                "asymmetric K/V dtypes; the kernel body rewrite is a follow-up "
-                "commit");
   using DTypeO = typename Params::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
   const uint32_t seq_len = params.kv_len;
 
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+  // vec_size must be large enough that both K and V cp_async loads reach
+  // the 128-bit minimum.  Using the smaller of the two element sizes
+  // ensures both meet the bound.
+  constexpr size_t min_kv_sizeof = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
+  constexpr uint32_t vec_size = std::max(16UL / min_kv_sizeof, HEAD_DIM / 32UL);
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   auto compute_capacity = GetCudaComputeCapability();
   static_assert(bdx <= 32U);
   DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
     constexpr uint32_t bdy = GROUP_SIZE;
+    constexpr uint32_t min_kv_elem_size = sizeof(DTypeK) < sizeof(DTypeV) ? sizeof(DTypeK) : sizeof(DTypeV);
     constexpr uint32_t num_threads =
-        std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
+        std::max(get_heuristic_num_threads(GROUP_SIZE, min_kv_elem_size), bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
+    constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (min_kv_elem_size == 1 ? 2U : 8U) : 1U;
     DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
+      // Asymmetric smem: K tiles at sizeof(DTypeK) per element, V tiles at
+      // sizeof(DTypeV) per element.  When DTypeK == DTypeV this simplifies
+      // to the pre-asymmetric formula.
       const uint32_t smem_size =
-          2U * NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +
+          NUM_STAGES_SMEM * bdy * tile_size_per_bdx * bdz * HEAD_DIM *
+              (sizeof(DTypeK) + sizeof(DTypeV)) +
           2U * bdy * bdz * sizeof(float);
       auto kernel =
           SingleDecodeWithKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
