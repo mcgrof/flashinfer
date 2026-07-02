@@ -230,9 +230,11 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
 
 
 @functools.cache
-def get_batch_decode_module(*args):
-    uri = get_batch_decode_uri(*args)
-    mod = gen_batch_decode_module(*args).build_and_load()
+def get_batch_decode_module(*args, dtype_k=None, dtype_v=None):
+    uri = get_batch_decode_uri(*args, dtype_k=dtype_k, dtype_v=dtype_v)
+    mod = gen_batch_decode_module(
+        *args, dtype_k=dtype_k, dtype_v=dtype_v
+    ).build_and_load()
     plan_func = mod.plan
     workspace_size_func = getattr(mod, "workspace_size", None)
     run_func = mod.run
@@ -549,6 +551,15 @@ def single_decode_with_kv_cache(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
+    if k.dtype != v.dtype:
+        # The single-decode JIT module is keyed on k.dtype only; without
+        # this check a mixed-dtype V tensor would be silently reinterpreted
+        # as k.dtype by the kernel.
+        raise NotImplementedError(
+            "single_decode_with_kv_cache does not support asymmetric K/V "
+            "dtypes; use BatchDecodeWithPagedKVCacheWrapper with "
+            "k_data_type/v_data_type instead."
+        )
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
@@ -935,6 +946,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        *,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -970,9 +984,29 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
+        # Equal K/V overrides are just the symmetric case: collapse them into
+        # kv_data_type so paths that key on kv_data_type stay consistent with
+        # run()'s per-side validation.
+        if k_data_type == v_data_type:
+            kv_data_type = k_data_type
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        # Mirror plan(): the workspace estimate must come from the same
+        # module the plan will use, and asymmetric dtypes are CUDA-core
+        # decode only.
+        if k_data_type != v_data_type and self._jit_module is not None:
+            raise NotImplementedError(
+                "Asymmetric K/V dtypes (k_data_type != v_data_type) are not "
+                "supported with a custom jit_args module."
+            )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -1037,6 +1071,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,
                     logits_soft_cap > 0,
                     False,
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
             qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
             args = [
@@ -1073,6 +1109,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,
                     logits_soft_cap > 0,
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
             args = [
                 self._float_workspace_buffer,
@@ -1122,6 +1160,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        *,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -1159,7 +1200,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to
-            ``q_data_type``. Defaults to ``None``.
+            ``q_data_type``. Defaults to ``None``. When ``k_data_type`` or
+            ``v_data_type`` are also supplied (asymmetric K/V), this still
+            acts as the fallback for whichever of the two is omitted.
+        k_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key tensor only. Use this together with
+            ``v_data_type`` to request asymmetric K/V quantization, for
+            example ``k_data_type=torch.float16, v_data_type=torch.float8_e4m3fn``
+            to keep keys at native precision while storing values in FP8.
+            If omitted, defaults to ``kv_data_type``.
+        v_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the value tensor only. See ``k_data_type``.
+            If omitted, defaults to ``kv_data_type``.
         o_data_type : Optional[Union[str, torch.dtype]]
             The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
             For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
@@ -1266,9 +1318,46 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # Asymmetric K/V: if caller omitted either half, fall back to
+        # kv_data_type. When both are omitted (the common case) k and v
+        # dtypes both equal kv_data_type and every downstream URI is
+        # identical to the symmetric path, so no JIT cache churn.
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
+        # Equal K/V overrides are just the symmetric case: collapse them into
+        # kv_data_type so paths that key on kv_data_type stay consistent with
+        # run()'s per-side validation.
+        if k_data_type == v_data_type:
+            kv_data_type = k_data_type
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        # Asymmetric K/V is implemented in the CUDA-core FA2 decode kernel
+        # only. The tensor-core path (including trtllm-gen and cute-dsl,
+        # which force use_tensor_cores) routes through prefill kernels that
+        # do not support split K/V dtypes yet; fail here with a clear error
+        # instead of a JIT-compile static_assert (fa2/fa3 prefill) or a
+        # silently symmetric module (trtllm-gen, cute-dsl). Custom jit_args
+        # modules were compiled with their own fixed dtypes, so asymmetric
+        # plan() requests cannot be honored by them either.
+        if k_data_type != v_data_type:
+            # H1: asymmetric bf16-K/fp8-V decode routes onto the tensor-core
+            # prefill-as-decode kernel (regular 16-bit fa2/fa3 family), which
+            # loads fp8 V and dequantizes to 16-bit before the PV MMA. The
+            # get_batch_prefill_module call below already threads dtype_k/dtype_v.
+            # Custom jit_args modules were compiled with one fixed KV dtype, so
+            # asymmetric plan() requests still cannot be honored by them.
+            if self._jit_module is not None:
+                raise NotImplementedError(
+                    "Asymmetric K/V dtypes are not supported with a custom "
+                    "jit_args module; the custom module was compiled with a "
+                    "single KV dtype."
+                )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -1279,6 +1368,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
@@ -1415,6 +1506,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
 
             args = [
@@ -1456,6 +1549,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
@@ -1676,9 +1771,24 @@ class BatchDecodeWithPagedKVCacheWrapper:
             page_size = k_cache.shape[1]
         else:
             page_size = k_cache.shape[2]
+        # The getattr fallbacks keep plan-state producers that predate the
+        # k/v split working (e.g. fast_decode_plan, which only refreshes an
+        # existing plan and never sets the per-side dtypes).
+        cached_k_dtype = getattr(self, "_cached_k_data_type", self._cached_kv_data_type)
+        cached_v_dtype = getattr(self, "_cached_v_data_type", self._cached_kv_data_type)
         _check_cached_qkv_data_type(
-            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+            q, k_cache, self._cached_q_data_type, cached_k_dtype
         )
+        # Asymmetric K/V: validate V dtype separately. The legacy helper
+        # above only checks K because kv_data_type used to cover both.
+        if v_cache.dtype != cached_v_dtype:
+            raise ValueError(
+                f"The dtype of v {v_cache.dtype} does not match the "
+                f"v_data_type {cached_v_dtype} specified in plan "
+                f"(kv_data_type was {self._cached_kv_data_type}). Pass "
+                f"k_data_type and v_data_type explicitly if you intended "
+                f"an asymmetric K/V cache."
+            )
         actual_batch_size = self._paged_kv_last_page_len_buf.size(0)
         # Soft-deprecation: q_len_per_req moved to plan(). Accept it at run()
         # with a warning and use to validate q.size(0)
