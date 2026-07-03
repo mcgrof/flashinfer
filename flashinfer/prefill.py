@@ -56,7 +56,6 @@ from .utils import (
     PosEncodingMode,
     TensorLayout,
     _check_block_tables_shape,
-    _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
@@ -1983,6 +1982,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
@@ -2128,6 +2129,32 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # Asymmetric K/V: k_data_type/v_data_type default to kv_data_type
+        # when omitted (back-compat). When set they may differ
+        # (e.g. k=bf16, v=fp8_e4m3). If both resolve equal, collapse back
+        # to a single kv_data_type so the symmetric module URI is unchanged.
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
+        if k_data_type == v_data_type:
+            kv_data_type = k_data_type
+        # Asymmetric K/V (k_data_type != v_data_type) is validated only for
+        # head_dim <= 256. Larger head dims take the VO-split prefill path,
+        # which has no FP8-V dequant and would read FP8 V as the key dtype;
+        # the kernel carries a matching static_assert as a backstop. Fail
+        # closed here with a clear error before JIT compilation.
+        if k_data_type != v_data_type and (
+            head_dim_qk > 256 or (head_dim_vo or head_dim_qk) > 256
+        ):
+            raise NotImplementedError(
+                "asymmetric K/V prefill (k_data_type "
+                f"{k_data_type} != v_data_type {v_data_type}) is only supported for "
+                f"head_dim <= 256, got head_dim_qk={head_dim_qk}, head_dim_vo="
+                f"{head_dim_vo if head_dim_vo is not None else head_dim_qk}."
+            )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -2267,6 +2294,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
 
         if self._jit_module is not None:
@@ -2296,7 +2325,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend,
+                    *get_module_args,
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
 
         self._block_tables = block_tables
@@ -2545,9 +2577,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
-        _check_cached_qkv_data_type(
-            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
-        )
+        # Asymmetric-aware paged KV validation (no dtype relaxation).
+        # Replaces the legacy symmetric _check_cached_qkv_data_type helper,
+        # which conflated K and V into one kv_data_type and would reject a
+        # BF16 K when V is FP8 (the entire point of asymmetric K/V).
+        _exp_q = self._cached_q_data_type
+        _exp_k = getattr(self, "_cached_k_data_type", self._cached_kv_data_type)
+        _exp_v = getattr(self, "_cached_v_data_type", self._cached_kv_data_type)
+        if q.dtype != _exp_q:
+            raise ValueError(f"q dtype {q.dtype} != cached q_data_type {_exp_q}")
+        if k_cache.dtype != _exp_k:
+            raise ValueError(
+                f"k_cache dtype {k_cache.dtype} != cached k_data_type {_exp_k}"
+            )
+        if v_cache.dtype != _exp_v:
+            raise ValueError(
+                f"v_cache dtype {v_cache.dtype} != cached v_data_type {_exp_v}"
+            )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
             if q.numel() != self._qo_indptr_last:
@@ -3093,6 +3139,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = True,
         prefix_len_ptr: Optional[torch.Tensor] = None,
@@ -3230,6 +3278,32 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # Asymmetric K/V: k_data_type/v_data_type default to kv_data_type
+        # when omitted (back-compat). When set they may differ
+        # (e.g. k=bf16, v=fp8_e4m3). If both resolve equal, collapse back
+        # to a single kv_data_type so the symmetric module URI is unchanged.
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
+        if k_data_type == v_data_type:
+            kv_data_type = k_data_type
+        # Asymmetric K/V (k_data_type != v_data_type) is validated only for
+        # head_dim <= 256. Larger head dims take the VO-split prefill path,
+        # which has no FP8-V dequant and would read FP8 V as the key dtype;
+        # the kernel carries a matching static_assert as a backstop. Fail
+        # closed here with a clear error before JIT compilation.
+        if k_data_type != v_data_type and (
+            head_dim_qk > 256 or (head_dim_vo or head_dim_qk) > 256
+        ):
+            raise NotImplementedError(
+                "asymmetric K/V prefill (k_data_type "
+                f"{k_data_type} != v_data_type {v_data_type}) is only supported for "
+                f"head_dim <= 256, got head_dim_qk={head_dim_qk}, head_dim_vo="
+                f"{head_dim_vo if head_dim_vo is not None else head_dim_qk}."
+            )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -3317,6 +3391,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        self._cached_k_data_type = k_data_type
+        self._cached_v_data_type = v_data_type
         self._cached_o_data_type = o_data_type
         kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
 
@@ -3413,7 +3489,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend,
+                    *get_module_args,
+                    dtype_k=k_data_type,
+                    dtype_v=v_data_type,
                 )
 
         if self._backend == "cutlass":
@@ -3583,9 +3662,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
-        _check_cached_qkv_data_type(
-            q, k, self._cached_q_data_type, self._cached_kv_data_type
-        )
+        # Asymmetric-aware ragged KV validation (no dtype relaxation).
+        # Replaces the legacy symmetric _check_cached_qkv_data_type helper,
+        # which conflated K and V into one kv_data_type and would reject a
+        # BF16 K when V is FP8 (the entire point of asymmetric K/V).
+        _exp_q = self._cached_q_data_type
+        _exp_k = getattr(self, "_cached_k_data_type", self._cached_kv_data_type)
+        _exp_v = getattr(self, "_cached_v_data_type", self._cached_kv_data_type)
+        if q.dtype != _exp_q:
+            raise ValueError(f"q dtype {q.dtype} != cached q_data_type {_exp_q}")
+        if k.dtype != _exp_k:
+            raise ValueError(f"k dtype {k.dtype} != cached k_data_type {_exp_k}")
+        if v.dtype != _exp_v:
+            raise ValueError(f"v dtype {v.dtype} != cached v_data_type {_exp_v}")
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
             if q.numel() != self._qo_indptr_last:
