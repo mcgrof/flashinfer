@@ -649,5 +649,65 @@ def test_asymmetric_head_dim_gt256_fails_closed():
         )
 
 
+def test_single_prefill_asymmetric_raises():
+    """The public single-prefill API keys its JIT module on k.dtype only, so a
+    mixed-dtype V must be rejected rather than silently reinterpreted. Asymmetric
+    K/V is served through the batch wrappers' k_data_type/v_data_type."""
+    q = torch.randn(16, 4, 128, device="cuda:0", dtype=torch.bfloat16)
+    k = torch.randn(64, 4, 128, device="cuda:0", dtype=torch.bfloat16)
+    v = torch.randn(64, 4, 128, device="cuda:0", dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    with pytest.raises(NotImplementedError, match=r"[Aa]symmetric"):
+        flashinfer.single_prefill_with_kv_cache(q, k, v)
+
+
+def test_workspace_size_accepts_asymmetric():
+    """workspace_size() accepts k_data_type/v_data_type and returns a sane
+    (float, int) byte tuple for an asymmetric plan (querying the same module the
+    plan will use), and fails closed for head_dim > 256 just like plan()."""
+    batch, kv_len, qo_len, page_size = 4, 64, 16, 16
+    ppq = (kv_len + page_size - 1) // page_size
+    qo_indptr = torch.arange(0, batch + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    kv_indptr = torch.arange(0, batch + 1, device="cuda:0", dtype=torch.int32) * ppq
+    kv_indices = torch.arange(0, ppq * batch, device="cuda:0", dtype=torch.int32)
+    kv_last = torch.full((batch,), page_size, dtype=torch.int32, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"), "NHD"
+    )
+    fb, ib = wrapper.workspace_size(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last,
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim_qk=128,
+        page_size=page_size,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        k_data_type=torch.bfloat16,
+        v_data_type=torch.float8_e4m3fn,
+    )
+    assert isinstance(fb, int) and isinstance(ib, int)
+    assert fb >= 0 and ib >= 0
+
+    with pytest.raises(NotImplementedError, match=r"head_dim <= 256"):
+        wrapper.workspace_size(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last,
+            num_qo_heads=8,
+            num_kv_heads=8,
+            head_dim_qk=512,
+            page_size=page_size,
+            causal=True,
+            q_data_type=torch.bfloat16,
+            k_data_type=torch.bfloat16,
+            v_data_type=torch.float8_e4m3fn,
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

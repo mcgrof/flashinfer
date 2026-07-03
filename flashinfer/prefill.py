@@ -1313,6 +1313,17 @@ def single_prefill_with_kv_cache(
     """
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
+    if k.dtype != v.dtype:
+        # The single-prefill JIT module is keyed on k.dtype only; without this
+        # check a mixed-dtype V tensor would be silently reinterpreted as
+        # k.dtype by the kernel. Asymmetric K/V (e.g. BF16 K + FP8 V) is served
+        # through the batch prefill wrappers' k_data_type/v_data_type instead.
+        raise NotImplementedError(
+            "single_prefill_with_kv_cache does not support asymmetric K/V "
+            "dtypes; use BatchPrefillWithPagedKVCacheWrapper or "
+            "BatchPrefillWithRaggedKVCacheWrapper with k_data_type/v_data_type "
+            "instead."
+        )
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1800,6 +1811,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        k_data_type: Optional[Union[str, torch.dtype]] = None,
+        v_data_type: Optional[Union[str, torch.dtype]] = None,
         o_data_type: Optional[Union[str, torch.dtype]] = None,
         prefix_len_ptr: Optional[torch.Tensor] = None,
         token_pos_in_items_ptr: Optional[torch.Tensor] = None,
@@ -1850,6 +1863,28 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        # Asymmetric K/V: k_data_type/v_data_type default to kv_data_type when
+        # omitted (back-compat). If both resolve equal, collapse back to a single
+        # kv_data_type so the workspace estimate queries the same module plan()
+        # will use. Mirror plan()'s head_dim <= 256 fail-close so the estimate
+        # never diverges from what plan() accepts.
+        if k_data_type is None:
+            k_data_type = kv_data_type
+        k_data_type = canonicalize_torch_dtype(k_data_type)
+        if v_data_type is None:
+            v_data_type = kv_data_type
+        v_data_type = canonicalize_torch_dtype(v_data_type)
+        if k_data_type == v_data_type:
+            kv_data_type = k_data_type
+        if k_data_type != v_data_type and (
+            head_dim_qk > 256 or (head_dim_vo or head_dim_qk) > 256
+        ):
+            raise NotImplementedError(
+                "asymmetric K/V prefill (k_data_type "
+                f"{k_data_type} != v_data_type {v_data_type}) is only supported for "
+                f"head_dim <= 256, got head_dim_qk={head_dim_qk}, head_dim_vo="
+                f"{head_dim_vo if head_dim_vo is not None else head_dim_qk}."
+            )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -1927,6 +1962,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 window_left >= 0,
                 logits_soft_cap > 0,
                 use_fp16_qk_reduction,
+                dtype_k=k_data_type,
+                dtype_v=v_data_type,
             )
         if module.workspace_size is None:
             raise NotImplementedError(
