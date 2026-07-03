@@ -97,9 +97,14 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
   }
 }
 
+// FI-2: side-specific dtypes for K and V shared-memory regions.  When
+// DTypeK == DTypeV (the symmetric/back-compat case) the byte layout is
+// bit-identical to before this commit.  DTypeK/DTypeV are appended AFTER
+// kEnableVOSplitOpt so the existing positional instantiations keep binding
+// correctly and default to DTypeKV (symmetric) unless overridden.
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
-          bool kEnableVOSplitOpt = false>
+          bool kEnableVOSplitOpt = false, typename DTypeK = DTypeKV, typename DTypeV = DTypeKV>
 struct SharedStorageQKVO {
   static constexpr bool kKVShareShape =
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
@@ -108,15 +113,20 @@ struct SharedStorageQKVO {
   // at large head dims. Must match KernelTraits::USE_KV_SHARED_SMEM.
   // Otherwise the single/ragged kernels cannot fit head_dim=512 K+V
   // tiles on SKUs with 99KB-smem (SM86/89/120/121).
-  static constexpr bool kVShareActive = kKVShareShape && !is_fp4_type_v<DTypeKV> &&
-                                        (HEAD_DIM_QK == HEAD_DIM_VO) &&
-                                        (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
+  static constexpr bool kVShareActive =
+      kKVShareShape && !is_fp4_type_v<DTypeKV> && (HEAD_DIM_QK == HEAD_DIM_VO) &&
+      // FI (Bucket B): V-share time-shares V INTO the
+      // DTypeK-typed k_smem region after Q.K^T. Only sound
+      // when K and V share a dtype; for asym K16/V8 it would
+      // load 1-byte FP8 V into a 2-byte-typed region. Disable
+      // when DTypeK != DTypeV. Symmetric => true, unchanged.
+      std::is_same_v<DTypeK, DTypeV> && (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
-      alignas(16) DTypeKV k_smem[CTA_TILE_KV * HEAD_DIM_QK];
+      alignas(16) DTypeK k_smem[CTA_TILE_KV * HEAD_DIM_QK];
       alignas(16)
-          std::conditional_t<kVShareActive, DTypeKV[1], DTypeKV[CTA_TILE_KV * HEAD_DIM_VO]> v_smem;
+          std::conditional_t<kVShareActive, DTypeV[1], DTypeV[CTA_TILE_KV * HEAD_DIM_VO]> v_smem;
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
       alignas(
@@ -152,7 +162,7 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
           uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
-          typename AttentionVariant_>
+          typename AttentionVariant_, typename DTypeV_ = DTypeKV_>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
@@ -174,12 +184,17 @@ struct KernelTraits {
   static constexpr bool USE_VO_SPLIT = (NUM_MMA_D_VO > 16) && (NUM_MMA_D_VO % NUM_WARPS_KV == 0);
   static constexpr uint32_t NUM_MMA_D_VO_PER_WARP =
       USE_VO_SPLIT ? (NUM_MMA_D_VO / NUM_WARPS_KV) : NUM_MMA_D_VO;
-  static constexpr bool USE_KV_SHARED_SMEM = USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> &&
-                                             (HEAD_DIM_QK == HEAD_DIM_VO) &&
-                                             (sizeof(DTypeKV_) == 2 || CTA_TILE_Q_ > 16);
+  static constexpr bool USE_KV_SHARED_SMEM =
+      USE_VO_SPLIT && !is_fp4_type_v<DTypeKV_> && (HEAD_DIM_QK == HEAD_DIM_VO) &&
+      // BUCKET B: V-share loads V INTO k_smem; requires
+      // one K/V dtype. For asym K16/V8 (K=bf16 2-byte,
+      // V=fp8 1-byte) the sizeof==2 clause is TRUE, so
+      // this guard disables V-share. Symmetric => true.
+      (std::is_same_v<DTypeKV_, DTypeV_>) && (sizeof(DTypeKV_) == 2 || CTA_TILE_Q_ > 16);
   static constexpr uint32_t UPCAST_STRIDE_Q = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_K = HEAD_DIM_QK / upcast_size<DTypeKV_>();
-  static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeKV_>();
+  // FI-4: V-side stride uses the now-independent DTypeV_; UPCAST_STRIDE_K keeps DTypeKV_.
+  static constexpr uint32_t UPCAST_STRIDE_V = HEAD_DIM_VO / upcast_size<DTypeV_>();
   static constexpr uint32_t UPCAST_STRIDE_O = HEAD_DIM_VO / upcast_size<DTypeO_>();
   static constexpr uint32_t CTA_TILE_Q = CTA_TILE_Q_;
   static constexpr uint32_t CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16;
@@ -192,6 +207,10 @@ struct KernelTraits {
   static constexpr PosEncodingMode POS_ENCODING_MODE = POS_ENCODING_MODE_;
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
+  // FI-3: K and V dtypes independent. DTypeKV retained as back-compat alias == DTypeK
+  // (DTypeKV_ carries the K dtype). DTypeV defaults to DTypeKV_ so symmetric is unchanged.
+  using DTypeK = DTypeKV_;
+  using DTypeV = DTypeV_;
   using DTypeO = DTypeO_;
   using DTypeQKAccum = DTypeQKAccum_;
   using IdType = IdType_;
@@ -217,11 +236,14 @@ struct KernelTraits {
             (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
   }
 
+  // FI-2/FI-3: thread DTypeK/DTypeV through shared storage; appended after kEnableVOSplitOpt,
+  // so the non-paged form pins kEnableVOSplitOpt=false to reach the DTypeK/DTypeV positions.
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
-                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
+                                          HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
+                                          /*kEnableVOSplitOpt=*/false, DTypeK, DTypeV>;
   using SharedStoragePaged =
       SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ,
-                        DTypeKV, DTypeO, /*kEnableVOSplitOpt=*/true>;
+                        DTypeKV, DTypeO, /*kEnableVOSplitOpt=*/true, DTypeK, DTypeV>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -352,13 +374,16 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half
  * \param kv_idx_base The base kv index.
  * \param kv_len The length of kv tensor.
  */
-template <bool produce_v, SharedMemFillMode fill_mode, typename KTraits>
+// FI-4d: produce_kv templated on the actual dtype loaded. Legacy callers infer
+// T = KTraits::DTypeKV via the default; asym V-side callers deduce T = DTypeV from &v_ptr.
+template <bool produce_v, SharedMemFillMode fill_mode, typename KTraits,
+          typename T = typename KTraits::DTypeKV>
 __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem,
-                                           uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
-                                           const uint32_t stride_n, const uint32_t kv_idx_base,
-                                           const uint32_t kv_len, const dim3 tid = threadIdx) {
+                                           uint32_t* smem_offset, T** gptr, const uint32_t stride_n,
+                                           const uint32_t kv_idx_base, const uint32_t kv_len,
+                                           const dim3 tid = threadIdx) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
-  using DTypeKV = typename KTraits::DTypeKV;
+  using DTypeKV = T;
   constexpr bool IS_FP4 = is_fp4_type_v<DTypeKV>;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
@@ -415,18 +440,25 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
   }
 }
 
-template <bool produce_v, typename KTraits, typename SmemStorage>
+// FI-4d: page_produce_kv templated on the actual dtype loaded. Legacy callers infer
+// T = KTraits::DTypeKV; asym V-side callers deduce T = DTypeV from kv_ptr.
+template <bool produce_v, typename KTraits, typename SmemStorage,
+          typename T = typename KTraits::DTypeKV>
 __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint32_t* smem_offset,
-                                                typename KTraits::DTypeKV* kv_ptr,
-                                                const uint32_t kv_idx_base,
+                                                T* kv_ptr, const uint32_t kv_idx_base,
                                                 const size_t* thr_local_kv_offset,
                                                 const uint32_t kv_len, const uint32_t warp_idx,
                                                 const uint32_t lane_idx) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
-  smem_t<KTraits::SWIZZLE_MODE_KV> smem(
-      (produce_v && !KTraits::USE_KV_SHARED_SMEM) ? smem_storage->v_smem : smem_storage->k_smem);
-  using DType = typename KTraits::DTypeKV;
+  // FI-4d: build smem from the side-specific buffer via explicit per-branch smem_t
+  // construction; in asym the two buffers differ in dtype and a raw-pointer ternary
+  // has no common type. Both branches yield the same smem_t<SWIZZLE_MODE_KV> wrapper.
+  smem_t<KTraits::SWIZZLE_MODE_KV> smem =
+      (produce_v && !KTraits::USE_KV_SHARED_SMEM)
+          ? smem_t<KTraits::SWIZZLE_MODE_KV>(smem_storage->v_smem)
+          : smem_t<KTraits::SWIZZLE_MODE_KV>(smem_storage->k_smem);
+  using DType = T;
   using IdType = typename KTraits::IdType;
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
@@ -802,8 +834,10 @@ template <typename KTraits>
 __device__ __forceinline__ void k_smem_inplace_apply_rotary(
     const uint32_t kv_idx_base, smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r,
     float (*rope_freq)[4], const dim3 tid = threadIdx) {
-  using DTypeKV = typename KTraits::DTypeKV;
-  static_assert(sizeof(DTypeKV) == 2);
+  // FI-5: K-side; rotary requires native-precision K (BF16/FP16).
+  using DTypeK = typename KTraits::DTypeK;
+  using DTypeKV = DTypeK;  // back-compat alias for the rope helpers below
+  static_assert(sizeof(DTypeK) == 2, "K-side RoPE requires 2-byte K dtype (BF16/FP16).");
   constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;
   uint32_t k_frag_local[2][4];
   const uint32_t lane_idx = tid.x;
@@ -921,8 +955,9 @@ __device__ __forceinline__ void compute_qk(
   // When reading from the BF16 repack buffer, K is laid out as native 16-bit, so
   // use the 16-bit b128 stride / element size instead of the FP8 packed ones.
   constexpr uint32_t KV_STRIDE = REPACK_BF16 ? KTraits::REPACK_STRIDE_QK : UPCAST_STRIDE_K;
+  // FI-5: K-side element size uses the K dtype.
   constexpr uint32_t KV_ESIZE =
-      REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeKV);
+      REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeK);
   uint32_t a_frag[KTraits::NUM_MMA_Q][4], b_frag[4];
   // compute q*k^T
 #pragma unroll
@@ -939,7 +974,9 @@ __device__ __forceinline__ void compute_qk(
 
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-      if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
+      // FI-5: K-side FP8 dequant path.  In asym K16/V8 K is BF16 so this constexpr
+      // is false and the plain BF16 ldmatrix branch is taken.
+      if constexpr (sizeof(typename KTraits::DTypeK) == 1 && !REPACK_BF16) {
         uint32_t b_frag_quant[2];
         if (mma_d % 2 == 0) {
           k_smem->ldmatrix_m8n8x4_left_half(*k_smem_offset_r, b_frag_quant);
@@ -953,8 +990,8 @@ __device__ __forceinline__ void compute_qk(
           b_frag_quant[0] = frag_layout_swizzle_16b_to_8b(b_frag_quant[0]);
           b_frag_quant[1] = frag_layout_swizzle_16b_to_8b(b_frag_quant[1]);
         }
-        vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeKV>::cast<8>(
-            (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeKV*)b_frag_quant);
+        vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeK>::cast<8>(
+            (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeK*)b_frag_quant);
         if constexpr (is_fp4_type_v<typename KTraits::DTypeKV>) {
           // Apply scaling factors for K.
           // SF smem is linear: sf[kv_row * SF_COLS + hd_group], SF_COLS = HEAD_DIM_QK/16.
@@ -1000,7 +1037,8 @@ __device__ __forceinline__ void compute_qk(
         }
       }
     }
-    if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
+    // FI-5: K-side column-stride advance keys on the K dtype.
+    if constexpr (sizeof(typename KTraits::DTypeK) == 1 && !REPACK_BF16) {
       if (mma_d % 2 == 1) {
         *k_smem_offset_r =
             k_smem->template advance_offset_by_column<2>(*k_smem_offset_r, mma_d / 2);
@@ -1288,8 +1326,9 @@ __device__ __forceinline__ void compute_sfm_v(
   constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
   // When reading from the BF16 repack buffer, V is native 16-bit.
   constexpr uint32_t VV_STRIDE = REPACK_BF16 ? KTraits::REPACK_STRIDE_VO : UPCAST_STRIDE_V;
+  // FI-5: V-side element size uses the V dtype.
   constexpr uint32_t VV_ESIZE =
-      REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeKV);
+      REPACK_BF16 ? sizeof(typename KTraits::DTypeQ) : sizeof(typename KTraits::DTypeV);
 
   typename KTraits::DTypeQ s_frag_f16[KTraits::NUM_MMA_Q][KTraits::NUM_MMA_KV][8];
   if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
@@ -1323,7 +1362,9 @@ __device__ __forceinline__ void compute_sfm_v(
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
       if (mma_d >= d_base && mma_d < d_base + KTraits::NUM_MMA_D_VO_TILE) {
         uint32_t b_frag[4];
-        if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
+        // FI-5: V-side FP8 dequant path.  In asym K16/V8 V is FP8 so this branch is
+        // taken; the K BF16 path in compute_qk is unaffected.
+        if constexpr (sizeof(typename KTraits::DTypeV) == 1 && !REPACK_BF16) {
           uint32_t b_frag_quant[2];
           if (mma_d % 2 == 0) {
             v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_quant);
@@ -1338,8 +1379,8 @@ __device__ __forceinline__ void compute_sfm_v(
             b_frag_quant[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[0]);
             b_frag_quant[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_quant[1]);
           }
-          vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeKV>::cast<8>(
-              (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeKV*)b_frag_quant);
+          vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeV>::cast<8>(
+              (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeV*)b_frag_quant);
           swap(b_frag[1], b_frag[2]);
           if constexpr (is_fp4_type_v<typename KTraits::DTypeKV>) {
             // Apply scaling factors for V.
@@ -1379,7 +1420,8 @@ __device__ __forceinline__ void compute_sfm_v(
           }
         }
       }
-      if constexpr (sizeof(typename KTraits::DTypeKV) == 1 && !REPACK_BF16) {
+      // FI-5: V-side column-stride advance keys on the V dtype.
+      if constexpr (sizeof(typename KTraits::DTypeV) == 1 && !REPACK_BF16) {
         if (mma_d % 2 == 1) {
           *v_smem_offset_r =
               v_smem->template advance_offset_by_column<2>(*v_smem_offset_r, mma_d / 2);
@@ -1708,6 +1750,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
   } else {
 #endif
     using DTypeKV = typename Params::DTypeKV;
+    // FI: K/V aliases. Symmetric: DTypeK==DTypeV==DTypeKV. Params carries them separately.
+    using DTypeK = typename Params::DTypeK;
+    using DTypeV = typename Params::DTypeV;
     using DTypeO = typename Params::DTypeO;
     using DTypeQKAccum = typename KTraits::DTypeQKAccum;
     using AttentionVariant = typename KTraits::AttentionVariant;
@@ -1732,8 +1777,8 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     [[maybe_unused]] constexpr MaskMode MASK_MODE = KTraits::MASK_MODE;
 
     DTypeQ* q = params.q;
-    DTypeKV* k = params.k;
-    DTypeKV* v = params.v;
+    DTypeK* k = params.k;
+    DTypeV* v = params.v;
     DTypeO* o = params.o;
     float* lse = params.lse;
     const uint32_t qo_len = params.qo_len;
@@ -1810,9 +1855,18 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
         block.sync();
       }
 
-      // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
-      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
-          v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
+      // V-share (USE_KV_SHARED_SMEM): V time-shares K's smem (v_smem points at
+      // k_smem storage); it is only enabled when DTypeK == DTypeV (see
+      // KernelTraits). `if constexpr` keeps the symmetric shared path
+      // bit-identical while letting the asymmetric build (DTypeK != DTypeV,
+      // where k_smem is DTypeK* and v_smem is DTypeV*) discard the
+      // type-incompatible shared branch instead of failing to compile.
+      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem;
+      if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+        v_smem = smem_t<SWIZZLE_MODE_KV>(smem_storage.k_smem);
+      } else {
+        v_smem = smem_t<SWIZZLE_MODE_KV>(smem_storage.v_smem);
+      }
 
       const uint32_t num_iterations = ceil_div(
           MASK_MODE == MaskMode::kCausal
@@ -1836,16 +1890,16 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
           CTA_TILE_KV;
 
       constexpr uint32_t fp4_pack = is_fp4_type_v<DTypeKV> ? 2 : 1;
-      DTypeKV* k_ptr =
+      DTypeK* k_ptr =
           k +
           (chunk_start + warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL) * k_stride_n +
           kv_head_idx * k_stride_h +
-          (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack;
-      DTypeKV* v_ptr =
+          (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeK>() / fp4_pack;
+      DTypeV* v_ptr =
           v +
           (chunk_start + warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL) * v_stride_n +
           kv_head_idx * v_stride_h +
-          (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack;
+          (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeV>() / fp4_pack;
 
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -2024,13 +2078,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                                cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
-  // Asymmetric K/V plumbing: the prefill kernel body still assumes a single
-  // KV element type for shared-memory layout, swizzle mode selection, and
-  // FP8 dequantization. Guard until the kernel body splits DTypeK/DTypeV;
-  // asymmetric K/V is currently supported by the decode kernels only.
-  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
-                "SinglePrefillWithKVCacheDispatched does not yet support "
-                "asymmetric K/V dtypes; only decode kernels do");
+  // Asymmetric K/V: DTypeKV carries the K dtype (Params::DTypeKV == DTypeK);
+  // DTypeV is the independent V dtype. When DTypeK == DTypeV (symmetric) all
+  // downstream byte-sizing and template instantiation below are bit-identical.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
   using DTypeO = typename Params::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
@@ -2081,13 +2133,16 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     // staging buffer still lives in SharedStorageQKVO, so it must be accounted.
     constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                                 (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
-    constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
-                               ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
-                               (HEAD_DIM_QK == HEAD_DIM_VO) &&
-                               (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
+    constexpr bool kKVShared =
+        !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
+        ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) && (HEAD_DIM_QK == HEAD_DIM_VO) &&
+        // Asym K/V: V time-shares the K-typed k_smem; only valid when
+        // K and V widths match. Disables V-share for K16/V8; no-op sym.
+        (sizeof(DTypeK) == sizeof(DTypeV)) && (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
     constexpr uint32_t kKVSmemPerMmaKV =
         (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-                   : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
+                   : ((HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 *
+                      NUM_WARPS_KV)) +
         (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                        sizeof(DTypeQ))
                     : 0u);
@@ -2126,7 +2181,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
       using KTraits =
           KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                        NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                       DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+                       DTypeQKAccum, typename Params::IdType, AttentionVariant, DTypeV>;
       if constexpr (KTraits::IsInvalid()) {
         // Invalid configuration, skip
         std::ostringstream err_msg;
@@ -2244,8 +2299,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     IdType* kv_tile_indices = params.kv_tile_indices;
     IdType* q_indptr = params.q_indptr;
     IdType* kv_indptr = params.kv_indptr;
-    DTypeKV* k = params.k;
-    DTypeKV* v = params.v;
+    // FI: K/V aliases (symmetric: DTypeK==DTypeV==DTypeKV).
+    using DTypeK = typename Params::DTypeK;
+    using DTypeV = typename Params::DTypeV;
+    DTypeK* k = params.k;
+    DTypeV* v = params.v;
     IdType* o_indptr = params.o_indptr;
     DTypeO* o = params.o;
     float* lse = params.lse;
@@ -2385,9 +2443,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                : chunk_size) /
           CTA_TILE_KV;
 
-      // K/V-shared path: V is loaded into k_smem (time-shared); v_smem is a [1] stub.
-      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem),
-          v_smem(KTraits::USE_KV_SHARED_SMEM ? smem_storage.k_smem : smem_storage.v_smem);
+      // V-share (USE_KV_SHARED_SMEM): V time-shares K's smem (v_smem points at
+      // k_smem storage); it is only enabled when DTypeK == DTypeV (see
+      // KernelTraits). `if constexpr` keeps the symmetric shared path
+      // bit-identical while letting the asymmetric build (DTypeK != DTypeV,
+      // where k_smem is DTypeK* and v_smem is DTypeV*) discard the
+      // type-incompatible shared branch instead of failing to compile.
+      smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem;
+      if constexpr (KTraits::USE_KV_SHARED_SMEM) {
+        v_smem = smem_t<SWIZZLE_MODE_KV>(smem_storage.k_smem);
+      } else {
+        v_smem = smem_t<SWIZZLE_MODE_KV>(smem_storage.v_smem);
+      }
 
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -2418,18 +2485,18 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       }
 
       constexpr uint32_t fp4_pack = is_fp4_type_v<DTypeKV> ? 2 : 1;
-      DTypeKV* k_ptr = k +
-                       (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
-                        lane_idx / KV_THR_LAYOUT_COL) *
-                           k_stride_n +
-                       kv_head_idx * k_stride_h +
-                       (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack;
-      DTypeKV* v_ptr = v +
-                       (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
-                        lane_idx / KV_THR_LAYOUT_COL) *
-                           v_stride_n +
-                       kv_head_idx * v_stride_h +
-                       (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack;
+      DTypeK* k_ptr = k +
+                      (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
+                       lane_idx / KV_THR_LAYOUT_COL) *
+                          k_stride_n +
+                      kv_head_idx * k_stride_h +
+                      (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeK>() / fp4_pack;
+      DTypeV* v_ptr = v +
+                      (kv_indptr[request_idx] + chunk_start + warp_idx * KV_THR_LAYOUT_ROW +
+                       lane_idx / KV_THR_LAYOUT_COL) *
+                          v_stride_n +
+                      kv_head_idx * v_stride_h +
+                      (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeV>() / fp4_pack;
 
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(k_smem, &k_smem_offset_w, &k_ptr,
                                                              k_stride_n, 0, chunk_size, tid);
@@ -2730,6 +2797,16 @@ __device__ __forceinline__ void vosplit_compute_pv(
   static_assert(!is_fp4_type_v<DTypeKV>,
                 "NVFP4 KV is not supported with the VO-split prefill kernel (head_dim > 256); "
                 "use bf16/fp16 or FP8 KV.");
+  // Asymmetric K/V (DTypeK != DTypeV, e.g. BF16-K + FP8-V) is NOT implemented on this
+  // VO-split path. Unlike compute_sfm_v (head_dim <= 256), the V dequant below keys
+  // IS_FP8, VO_COLS_PER_TILE and vec_cast on DTypeKV (== DTypeK, the KEY dtype); for a
+  // 2-byte key with 1-byte FP8 V that skips the FP8 dequant and reads packed FP8 bytes
+  // through the 16-bit ldmatrix path, silently corrupting output. Fail closed here:
+  // asymmetric prefill is validated only for head_dim <= 256 (which never reaches the
+  // VO-split path). Symmetric head_dim >= 512 (DTypeK == DTypeV) is unaffected.
+  static_assert(std::is_same_v<typename KTraits::DTypeK, typename KTraits::DTypeV>,
+                "asymmetric K/V (DTypeK != DTypeV) is not supported on the VO-split prefill "
+                "kernel (head_dim > 256); asymmetric K/V is supported for head_dim <= 256.");
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
   const uint32_t q_row_base = (warp_q_idx * NUM_MMA_Q) * 16;
   constexpr uint32_t NUM_MMA_D_VO_PER_WARP = KTraits::NUM_MMA_D_VO_PER_WARP;
@@ -2896,7 +2973,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     DTypeO* o = params.o;
     float* lse = params.lse;
     bool* block_valid_mask = params.block_valid_mask;
-    const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
+    // FI: K/V aliases (symmetric: DTypeK==DTypeV==DTypeKV).
+    using DTypeK = typename Params::DTypeK;
+    using DTypeV = typename Params::DTypeV;
+    // Bind paged_kv with side-specific dtypes so K may be BF16 while V is FP8.
+    const paged_kv_t<DTypeK, IdType, DTypeV>& paged_kv = params.paged_kv;
     const bool partition_kv = params.partition_kv;
     const uint_fastdiv& group_size = params.group_size;
 
@@ -3039,9 +3120,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
 
       smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
-      size_t thr_local_kv_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
+      // FI: K and V may have different dtypes; per-lane byte offset depends on
+      // upcast_size<T>. Two offset arrays so V loads are not misaligned by the K stride.
+      // Symmetric: both arrays hold identical values.
+      size_t thr_local_k_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
+      size_t thr_local_v_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
       // K/V-shared path: V(iter) reuses the page offsets that loaded K(iter) (same
-      // tile). thr_local_kv_offset gets overwritten with the NEXT tile's offsets at
+      // tile). thr_local_*_offset gets overwritten with the NEXT tile's offsets at
       // the loop head, so stash the current tile's offsets here for the V load.
       [[maybe_unused]] size_t shared_v_kv_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
 
@@ -3085,12 +3170,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                   page_iter, entry_idx);
         // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to fp8
         constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
-        thr_local_kv_offset[i] = paged_kv.protective_get_kv_offset(
+        thr_local_k_offset[i] = paged_kv.protective_get_kv_offset(
             page_iter, kv_head_idx, entry_idx,
-            (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor, last_indptr);
+            (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeK>() / fp4_pack_factor, last_indptr);
+        thr_local_v_offset[i] = paged_kv.protective_get_kv_offset(
+            page_iter, kv_head_idx, entry_idx,
+            (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeV>() / fp4_pack_factor, last_indptr);
       }
       page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data, 0,
-                                      thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+                                      thr_local_k_offset, chunk_size, warp_idx, lane_idx);
       page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
                                          last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
                                          paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
@@ -3102,11 +3190,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         // inside iter 0 after Q.K^T. Stash tile-0 offsets for that load.
 #pragma unroll
         for (uint32_t i = 0; i < NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q; ++i) {
-          shared_v_kv_offset[i] = thr_local_kv_offset[i];
+          shared_v_kv_offset[i] = thr_local_v_offset[i];
         }
       } else {
         page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
-                                       thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
+                                       thr_local_v_offset, chunk_size, warp_idx, lane_idx);
         page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
                                           last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
                                           paged_kv.stride_page, paged_kv.stride_h,
@@ -3191,9 +3279,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                     page_iter, entry_idx);
           // FP4: GMEM is packed (2 FP4/byte), so the column byte offset is halved relative to fp8
           constexpr uint32_t fp4_pack_factor = is_fp4_type_v<DTypeKV> ? 2 : 1;
-          thr_local_kv_offset[i] = paged_kv.protective_get_kv_offset(
+          thr_local_k_offset[i] = paged_kv.protective_get_kv_offset(
               page_iter, kv_head_idx, entry_idx,
-              (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor,
+              (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeK>() / fp4_pack_factor,
+              last_indptr);
+          thr_local_v_offset[i] = paged_kv.protective_get_kv_offset(
+              page_iter, kv_head_idx, entry_idx,
+              (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeV>() / fp4_pack_factor,
               last_indptr);
         }
         // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
@@ -3286,7 +3378,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           cp_async::wait_group<0>();
         } else {
           page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
-                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
+                                          (iter + 1) * CTA_TILE_KV, thr_local_k_offset, chunk_size,
                                           warp_idx, lane_idx);
           page_produce_kv_sf<false, KTraits>(
               &smem_storage, maybe_k_cache_sf, packed_page_iter_base,
@@ -3325,16 +3417,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         block.sync();
         if constexpr (KTraits::USE_KV_SHARED_SMEM) {
           page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
-                                          (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
+                                          (iter + 1) * CTA_TILE_KV, thr_local_k_offset, chunk_size,
                                           warp_idx, lane_idx);
           cp_async::commit_group();
 #pragma unroll
           for (uint32_t i = 0; i < NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q; ++i) {
-            shared_v_kv_offset[i] = thr_local_kv_offset[i];
+            shared_v_kv_offset[i] = thr_local_v_offset[i];
           }
         } else {
           page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                         (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
+                                         (iter + 1) * CTA_TILE_KV, thr_local_v_offset, chunk_size,
                                          warp_idx, lane_idx);
           page_produce_kv_sf<true, KTraits>(
               &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
@@ -3430,10 +3522,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                                                     cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
-  // Asymmetric K/V plumbing; see SinglePrefillWithKVCacheDispatched above.
-  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
-                "BatchPrefillWithRaggedKVCacheDispatched does not yet support "
-                "asymmetric K/V dtypes; only decode kernels do");
+  // Asymmetric K/V: DTypeKV carries the K dtype; DTypeV is the independent V dtype.
+  // When DTypeK == DTypeV (symmetric) everything below is bit-identical.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
   using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
@@ -3480,13 +3572,16 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   // Matches KernelTraits::USE_KV_SHARED_SMEM: at large head dims K and V
   // time-share one smem buffer, so the occupancy budget counts the K/V
   // footprint once exactly when the kernel actually shares it.
-  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
-                             ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
-                             (HEAD_DIM_QK == HEAD_DIM_VO) &&
-                             (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
+  constexpr bool kKVShared =
+      !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
+      ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) && (HEAD_DIM_QK == HEAD_DIM_VO) &&
+      // Asym K/V: V time-shares the K-typed k_smem; only valid when
+      // K and V widths match. Disables V-share for K16/V8; no-op sym.
+      (sizeof(DTypeK) == sizeof(DTypeV)) && (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   constexpr uint32_t kKVSmemPerMmaKV =
-      (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-                 : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
+      (kKVShared
+           ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+           : ((HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 * NUM_WARPS_KV)) +
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u);
@@ -3531,7 +3626,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                      NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+                     DTypeQKAccum, typename Params::IdType, AttentionVariant, DTypeV>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
@@ -3620,10 +3715,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
-  // Asymmetric K/V plumbing; see SinglePrefillWithKVCacheDispatched above.
-  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
-                "BatchPrefillWithPagedKVCacheDispatched does not yet support "
-                "asymmetric K/V dtypes; only decode kernels do");
+  // Asymmetric K/V: DTypeKV carries the K dtype; DTypeV is the independent V dtype.
+  // When DTypeK == DTypeV (symmetric) everything below is bit-identical.
+  using DTypeK = typename Params::DTypeK;
+  using DTypeV = typename Params::DTypeV;
   using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
@@ -3669,15 +3764,18 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // Matches KernelTraits::USE_KV_SHARED_SMEM: K/V share one smem buffer for bf16/fp16 at every
   // tile and for FP8 only at CTA_TILE_Q=32 (not NVFP4), so the occupancy budget counts the K/V
   // footprint once exactly when the kernel actually shares it.
-  constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
-                             ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
-                             (HEAD_DIM_QK == HEAD_DIM_VO) &&
-                             (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
+  constexpr bool kKVShared =
+      !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
+      ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) && (HEAD_DIM_QK == HEAD_DIM_VO) &&
+      // Asym K/V: V time-shares the K-typed k_smem; only valid when
+      // K and V widths match. Disables V-share for K16/V8; no-op sym.
+      (sizeof(DTypeK) == sizeof(DTypeV)) && (sizeof(DTypeKV) == 2 || CTA_TILE_Q > 16);
   constexpr bool kVOSplitDispatch =
       (HEAD_DIM_VO / 16 > 16) && ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0);
   constexpr uint32_t kKVSmemPerMmaKV =
-      (kKVShared ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-                 : ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))) +
+      (kKVShared
+           ? (HEAD_DIM_QK * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+           : ((HEAD_DIM_QK * sizeof(DTypeK) + HEAD_DIM_VO * sizeof(DTypeV)) * 16 * NUM_WARPS_KV)) +
       (kUseRepack ? ((HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO) * 16 * NUM_WARPS_KV *
                      sizeof(DTypeQ))
                   : 0u) +
@@ -3720,7 +3818,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                      NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
-                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+                     DTypeQKAccum, typename Params::IdType, AttentionVariant, DTypeV>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
