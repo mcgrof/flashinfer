@@ -314,9 +314,11 @@ def get_trtllm_gen_prefill_module():
 
 
 @functools.cache
-def get_single_prefill_module(backend, *args):
-    uri = get_single_prefill_uri(backend, *args)
-    module = gen_single_prefill_module(backend, *args).build_and_load()
+def get_single_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
+    uri = get_single_prefill_uri(backend, *args, dtype_k=dtype_k, dtype_v=dtype_v)
+    module = gen_single_prefill_module(
+        backend, *args, dtype_k=dtype_k, dtype_v=dtype_v
+    ).build_and_load()
     run_func = module.run
 
     # torch library for single_prefill_with_kv_cache
@@ -1314,16 +1316,18 @@ def single_prefill_with_kv_cache(
     _check_pos_encoding_mode(pos_encoding_mode)
     _check_kv_layout(kv_layout)
     if k.dtype != v.dtype:
-        # The single-prefill JIT module is keyed on k.dtype only; without this
-        # check a mixed-dtype V tensor would be silently reinterpreted as
-        # k.dtype by the kernel. Asymmetric K/V (e.g. BF16 K + FP8 V) is served
-        # through the batch prefill wrappers' k_data_type/v_data_type instead.
-        raise NotImplementedError(
-            "single_prefill_with_kv_cache does not support asymmetric K/V "
-            "dtypes; use BatchPrefillWithPagedKVCacheWrapper or "
-            "BatchPrefillWithRaggedKVCacheWrapper with k_data_type/v_data_type "
-            "instead."
-        )
+        # Asymmetric K/V (16-bit K, FP8 V): the kernel dequantizes FP8 V to the
+        # key dtype (both the FA2 and FA3 single kernels thread DTypeV), and the
+        # distinct V dtype is threaded into the JIT module key via dtype_v below.
+        # Fail closed for head_dim > 256: that takes the VO-split path, which keys
+        # V dequant on the K dtype (mirrors the batch-prefill limit).
+        head_dim_vo_ = v.shape[-1]
+        if q.shape[-1] > 256 or head_dim_vo_ > 256:
+            raise NotImplementedError(
+                "single_prefill_with_kv_cache asymmetric K/V "
+                f"(k={k.dtype} != v={v.dtype}) is only supported for head_dim "
+                f"<= 256, got head_dim_qk={q.shape[-1]}, head_dim_vo={head_dim_vo_}."
+            )
     tmp = torch.empty(SINGLE_KERNEL_TMP_SIZE, dtype=torch.uint8, device=q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -1401,6 +1405,9 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         use_fp16_qk_reduction,
+        # Asymmetric K/V: distinct V dtype must key the JIT module. Defaults to
+        # the k.dtype slot when symmetric, so symmetric URIs stay byte-identical.
+        dtype_v=v.dtype,
     )
 
     module.run(
