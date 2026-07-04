@@ -649,16 +649,52 @@ def test_asymmetric_head_dim_gt256_fails_closed():
         )
 
 
-def test_single_prefill_asymmetric_raises():
-    """The public single-prefill API keys its JIT module on k.dtype only, so a
-    mixed-dtype V must be rejected rather than silently reinterpreted. Asymmetric
-    K/V is served through the batch wrappers' k_data_type/v_data_type."""
-    q = torch.randn(16, 4, 128, device="cuda:0", dtype=torch.bfloat16)
-    k = torch.randn(64, 4, 128, device="cuda:0", dtype=torch.bfloat16)
-    v = torch.randn(64, 4, 128, device="cuda:0", dtype=torch.float32).to(
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("k_dtype", K_DTYPES)
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_single_prefill_asymmetric_kv(head_dim, causal, k_dtype, v_dtype):
+    """Single-prefill with asymmetric K/V: 16-bit K (fp16/bf16) attended against
+    FP8 (e4m3/e5m2) V. The kernel dequantizes FP8 V to the key dtype; the output
+    must match an fp32 reference (error dominated by FP8 V quantization noise, as
+    on the batch paged/ragged paths). Backend is auto-selected (fa2 on SM80/89,
+    fa3 on SM90); both single kernels thread DTypeV."""
+    num_qo_heads, num_kv_heads, qo_len, kv_len = 32, 4, 32, 129
+    torch.manual_seed(7)
+    q = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=k_dtype)
+    k = (
+        torch.randn(kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=k_dtype)
+        * 0.5
+    )
+    v_fp32 = (
+        torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float32
+        )
+        * 0.5
+    )
+    v = v_fp32.to(v_dtype)
+
+    o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=causal)
+
+    sm_scale = 1.0 / (head_dim**0.5)
+    o_ref = _ref_prefill(q, k.float(), v.float(), sm_scale, causal)
+    rel = (o.float() - o_ref).norm() / o_ref.norm().clamp_min(1e-6)
+    assert rel.item() < MEDIAN_REL_ERR_BOUND, (
+        f"single asym rel err {rel.item()} exceeds {MEDIAN_REL_ERR_BOUND} "
+        f"(k={k_dtype}, v={v_dtype}, hd={head_dim}, causal={causal})"
+    )
+
+
+def test_single_prefill_asymmetric_hd512_fails_closed():
+    """head_dim > 256 asymmetric single-prefill takes the VO-split path, which
+    keys V dequant on the K dtype (would mis-read FP8 V), so it must fail closed
+    with NotImplementedError — mirroring the batch-prefill head_dim>256 guard."""
+    q = torch.randn(16, 4, 512, device="cuda:0", dtype=torch.bfloat16)
+    k = torch.randn(64, 4, 512, device="cuda:0", dtype=torch.bfloat16)
+    v = torch.randn(64, 4, 512, device="cuda:0", dtype=torch.float32).to(
         torch.float8_e4m3fn
     )
-    with pytest.raises(NotImplementedError, match=r"[Aa]symmetric"):
+    with pytest.raises(NotImplementedError, match=r"head_dim"):
         flashinfer.single_prefill_with_kv_cache(q, k, v)
 
 

@@ -353,10 +353,13 @@ def get_single_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> str:
     return (
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"{_kv_uri_fragment(dtype_kv, dtype_k, dtype_v)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
@@ -528,6 +531,9 @@ def gen_single_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
     uri = get_single_prefill_uri(
         backend,
@@ -540,6 +546,8 @@ def gen_single_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -609,6 +617,8 @@ def gen_single_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     )
 
 
@@ -1353,12 +1363,22 @@ def gen_customize_single_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ) -> JitSpec:
+    # Asymmetric K/V: DTypeK/DTypeV default to dtype_kv (symmetric) when not
+    # supplied, so existing callers render byte-identically. The jinja configs
+    # already read dtype_k/dtype_v (default(dtype_kv)).
+    eff_dtype_k = dtype_k if dtype_k is not None else dtype_kv
+    eff_dtype_v = dtype_v if dtype_v is not None else dtype_kv
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
         "dtype_q": dtype_map[dtype_q],
         "dtype_kv": dtype_map_kv[dtype_kv],
+        "dtype_k": dtype_map_kv[eff_dtype_k],
+        "dtype_v": dtype_map_kv[eff_dtype_v],
         "dtype_o": dtype_map[dtype_o],
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
