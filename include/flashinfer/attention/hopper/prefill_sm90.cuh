@@ -65,9 +65,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
 
-  using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
-  using PipelineParams = typename MainloopPipeline::Params;
-  using PipelineState = typename MainloopPipeline::PipelineState;
+  // K and V pipelines may differ for asymmetric K/V under TMA: K on TMA
+  // (PipelineTmaAsync), V on cp.async (PipelineAsync). For symmetric they are the
+  // same type. See kernel_traits.cuh / mainloop.cuh.
+  using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
+  using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
+  using PipelineParamsK = typename MainloopPipelineK::Params;
+  using PipelineParamsV = typename MainloopPipelineV::Params;
+  using PipelineState = typename Ktraits::PipelineState;
 
   extern __shared__ char shared_memory[];
   auto& shared_storage = *reinterpret_cast<typename Ktraits::SharedStorage*>(shared_memory);
@@ -84,16 +89,34 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   // Obtain warp index
   int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
-  PipelineParams pipeline_params;
   int warp_group_idx = cutlass::canonical_warp_group_idx();
-  pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
-                                             : MainloopPipeline::ThreadCategory::Consumer;
+
+  // K-side pipeline params: TMA on ragged/single (use_tma_load_kv), cp.async on
+  // paged.
+  PipelineParamsK pipeline_params_k;
+  pipeline_params_k.role = warp_group_idx == 0 ? MainloopPipelineK::ThreadCategory::Producer
+                                               : MainloopPipelineK::ThreadCategory::Consumer;
   if constexpr (use_tma_load_kv) {
-    pipeline_params.is_leader = warp_group_thread_idx == 0;
-    pipeline_params.num_consumers = NUM_MMA_THREADS;
+    pipeline_params_k.is_leader = warp_group_thread_idx == 0;
+    pipeline_params_k.num_consumers = NUM_MMA_THREADS;
   } else {
-    pipeline_params.producer_arv_count = NUM_COPY_THREADS;
-    pipeline_params.consumer_arv_count = NUM_MMA_THREADS;
+    pipeline_params_k.producer_arv_count = NUM_COPY_THREADS;
+    pipeline_params_k.consumer_arv_count = NUM_MMA_THREADS;
+  }
+
+  // V-side pipeline params: same as K, except for asymmetric K/V under TMA where
+  // V is a cp.async (PipelineAsync) pipeline. Its producer is the full producer
+  // warpgroup (NUM_COPY_THREADS threads) dequantizing FP8 V into 16-bit smem.
+  static constexpr bool v_uses_tma = use_tma_load_kv && !Ktraits::IS_ASYM;
+  PipelineParamsV pipeline_params_v;
+  pipeline_params_v.role = warp_group_idx == 0 ? MainloopPipelineV::ThreadCategory::Producer
+                                               : MainloopPipelineV::ThreadCategory::Consumer;
+  if constexpr (v_uses_tma) {
+    pipeline_params_v.is_leader = warp_group_thread_idx == 0;
+    pipeline_params_v.num_consumers = NUM_MMA_THREADS;
+  } else {
+    pipeline_params_v.producer_arv_count = NUM_COPY_THREADS;
+    pipeline_params_v.consumer_arv_count = NUM_MMA_THREADS;
   }
 
   if (warp_idx == 0 && lane_predicate) {
@@ -101,23 +124,23 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     shared_storage.barrier_O.init(/*num_threads=*/1);
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
-  MainloopPipeline pipeline_k = [&] {
+  MainloopPipelineK pipeline_k = [&] {
     if constexpr (use_tma_load_kv) {
-      pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
-      return MainloopPipeline(shared_storage.pipeline_k, pipeline_params,
-                              /*cluster_shape=*/Shape<_1, _1, _1>{});
+      pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
+      return MainloopPipelineK(shared_storage.pipeline_k, pipeline_params_k,
+                               /*cluster_shape=*/Shape<_1, _1, _1>{});
     } else {
-      return MainloopPipeline(shared_storage.pipeline_k, pipeline_params);
+      return MainloopPipelineK(shared_storage.pipeline_k, pipeline_params_k);
     }
   }();
 
-  MainloopPipeline pipeline_v = [&] {
-    if constexpr (use_tma_load_kv) {
-      pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
-      return MainloopPipeline(shared_storage.pipeline_v, pipeline_params,
-                              /*cluster_shape=*/Shape<_1, _1, _1>{});
+  MainloopPipelineV pipeline_v = [&] {
+    if constexpr (v_uses_tma) {
+      pipeline_params_v.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
+      return MainloopPipelineV(shared_storage.pipeline_v, pipeline_params_v,
+                               /*cluster_shape=*/Shape<_1, _1, _1>{});
     } else {
-      return MainloopPipeline(shared_storage.pipeline_v, pipeline_params);
+      return MainloopPipelineV(shared_storage.pipeline_v, pipeline_params_v);
     }
   }();
 
@@ -154,8 +177,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
     if (!use_tma_load_kv || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
-      PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
-      PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
+      PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipelineK>();
+      PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipelineV>();
 
       int work_idx = 0;
 

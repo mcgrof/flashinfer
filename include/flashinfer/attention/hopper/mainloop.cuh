@@ -73,9 +73,16 @@ struct CollectiveMainloop {
       take<0, 2>(SmemLayoutV{}), select<2, 1>(TileShape_PDV{}), _1{}));  // no mcast
 
   static constexpr bool USE_TMA_LOAD_KV = true;
-  using MainloopPipeline = typename Ktraits::MainloopPipeline;
+  // K always loads via TMA. V loads via TMA too, except for asymmetric K/V
+  // (16-bit K, FP8 V): TMA cannot dtype-convert FP8->16-bit, so V is loaded via
+  // cp.async and dequantized in the producer (MainloopPipelineV = PipelineAsync
+  // for asym, PipelineTmaAsync for symmetric). See kernel_traits.cuh.
+  using MainloopPipelineK = typename Ktraits::MainloopPipelineK;
+  using MainloopPipelineV = typename Ktraits::MainloopPipelineV;
+  using MainloopPipeline = MainloopPipelineK;  // back-compat alias
+  static constexpr bool IS_ASYM = Ktraits::IS_ASYM;
   using PipelineParams = typename MainloopPipeline::Params;
-  using PipelineState = typename MainloopPipeline::PipelineState;
+  using PipelineState = typename Ktraits::PipelineState;
 
   // Set the bytes transferred in this TMA transaction (may involve multiple issues)
   static constexpr uint32_t TmaTransactionBytesQ =
@@ -153,8 +160,8 @@ struct CollectiveMainloop {
 
   template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
             typename SharedStorage>
-  CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
-                           MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
+  CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipelineK pipeline_k,
+                           MainloopPipelineV pipeline_v, PipelineState& smem_pipe_write_k,
                            PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
                            Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
@@ -252,7 +259,7 @@ struct CollectiveMainloop {
     scheduler.broadcast_next_work(work_tile_info);
   }
 
-  CUTLASS_DEVICE void load_tail(MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
+  CUTLASS_DEVICE void load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v,
                                 PipelineState& smem_pipe_write_k,
                                 PipelineState& smem_pipe_write_v) {
     int lane_predicate = cute::elect_one_sync();
