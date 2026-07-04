@@ -528,26 +528,30 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  // Asymmetric K/V plumbing: the SM90 mainloop, TMA descriptors and kernel
-  // traits are parameterized on a single KV dtype. Guard until the Hopper
-  // path splits DTypeK/DTypeV; asymmetric K/V is decode-only today.
-  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
-                "SM90 SinglePrefillWithKVCacheDispatched does not yet support "
-                "asymmetric K/V dtypes; only decode kernels do");
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  // Asymmetric K/V (16-bit K, FP8 V) is not yet supported on the single/ragged
+  // SM90 prefill paths: they use TMA loads, which cannot dtype-convert V during
+  // the copy. Only the paged path implements it. Fail closed at *runtime* (not a
+  // static_assert) so the shared JIT module (paged + ragged + single kernels)
+  // still compiles for asymmetric dtypes without instantiating the TMA mainloop
+  // with a mismatched V dtype.
+  if constexpr (!std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>) {
+    return cudaErrorNotSupported;
+  } else {
+    if (MASK_MODE == MaskMode::kCustom) {
+      return cudaErrorNotSupported;  // Not supported yet.
+    }
+    constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+    constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+    SinglePrefillWithKVCacheKernelTraitsDispatched<
+        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                              /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                              /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                              typename Params::DTypeO, typename Params::IdType, AttentionVariant,
+                              typename Params::DTypeV>,
+        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+    return cudaGetLastError();
   }
-  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
-  SinglePrefillWithKVCacheKernelTraitsDispatched<
-      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
-                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
-                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                            typename Params::DTypeO, typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
-      LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
-  cudaError_t status = cudaGetLastError();
-  return status;
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
@@ -555,24 +559,27 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
                                                     cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  // Asymmetric K/V plumbing; see SM90 SinglePrefillWithKVCacheDispatched.
-  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
-                "SM90 BatchPrefillWithRaggedKVCacheDispatched does not yet "
-                "support asymmetric K/V dtypes; only decode kernels do");
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;  // Not supported yet.
+  // Asymmetric K/V not yet supported on the ragged (TMA) SM90 prefill path; fail
+  // closed at runtime so the shared JIT module still compiles (see the single
+  // path above for the rationale). Only the paged path implements asymmetric K/V.
+  if constexpr (!std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>) {
+    return cudaErrorNotSupported;
+  } else {
+    if (MASK_MODE == MaskMode::kCustom) {
+      return cudaErrorNotSupported;  // Not supported yet.
+    }
+    constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+    constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+    BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                              /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                              /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                              typename Params::DTypeO, typename Params::IdType, AttentionVariant,
+                              typename Params::DTypeV>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+    return cudaGetLastError();
   }
-  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
-  BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
-      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
-                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
-                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                            typename Params::DTypeO, typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
-      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  cudaError_t status = cudaGetLastError();
-  return status;
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
@@ -580,10 +587,16 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_pdl,
                                                    cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  // Asymmetric K/V plumbing; see SM90 SinglePrefillWithKVCacheDispatched.
-  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>,
-                "SM90 BatchPrefillWithPagedKVCacheDispatched does not yet "
-                "support asymmetric K/V dtypes; only decode kernels do");
+  // Asymmetric K/V on the paged SM90 prefill path: 16-bit K (bf16/fp16) attended
+  // against FP8 V. The producer (SparseCollectiveMainloop) dequantizes FP8 V ->
+  // 16-bit into the (unchanged) 16-bit V shared memory before the 16-bit PV
+  // WGMMA; keys and the QK path are unaffected, and P stays full precision. The
+  // only supported combinations are symmetric K == V and asymmetric 16-bit K +
+  // FP8 V; anything else fails closed.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV> ||
+                    (sizeof(typename Params::DTypeK) == 2 && sizeof(typename Params::DTypeV) == 1),
+                "SM90 BatchPrefillWithPagedKVCacheDispatched supports symmetric K/V "
+                "or asymmetric 16-bit K + FP8 V only");
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.
   }

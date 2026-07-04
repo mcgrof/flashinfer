@@ -37,6 +37,11 @@ template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIIT
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
+  // Value-side dtype. For asymmetric K/V (16-bit K, FP8 V) DTypeV != DTypeKV:
+  // V is stored FP8 in global memory but dequantized to DTypeKV (16-bit) in the
+  // producer so the shared-memory V tile and the PV WGMMA stay 16-bit.
+  using DTypeV = typename Ktraits::DTypeV;
+  static constexpr bool IS_ASYM = !std::is_same_v<DTypeKV, DTypeV>;
   using IdType = typename Ktraits::IdType;
   using TileShape_QKD = typename Ktraits::TileShape_QKD;
   using TileShape_PDV = typename Ktraits::TileShape_PDV;
@@ -106,7 +111,7 @@ struct SparseCollectiveMainloop {
     LayoutT layout_Q;
     DTypeKV const* K_ptr;
     LayoutT layout_K;
-    DTypeKV const* V_ptr;
+    DTypeV const* V_ptr;
     LayoutT layout_V;
     IdType const* kv_indices;
     int window_left;
@@ -123,7 +128,7 @@ struct SparseCollectiveMainloop {
     LayoutT layout_V;
     TMA_Q tma_load_Q;
     DTypeKV* K_ptr;
-    DTypeKV* V_ptr;
+    DTypeV* V_ptr;
     IdType* kv_indices;
     int window_left;
     int64_t k_page_stride;   // Stride between pages for K
@@ -141,7 +146,7 @@ struct SparseCollectiveMainloop {
             args.layout_V,
             tma_load_Q,
             const_cast<DTypeKV*>(args.K_ptr),
-            const_cast<DTypeKV*>(args.V_ptr),
+            const_cast<DTypeV*>(args.V_ptr),
             const_cast<IdType*>(args.kv_indices),
             args.window_left,
             args.k_page_stride,            // Use stride from arguments
@@ -218,7 +223,7 @@ struct SparseCollectiveMainloop {
 
     // Store base pointers and indices for manual page table lookup
     DTypeKV* K_ptr_base = mainloop_params.K_ptr + kv_head_idx * stride<2>(mainloop_params.layout_K);
-    DTypeKV* V_ptr_base = mainloop_params.V_ptr + kv_head_idx * stride<2>(mainloop_params.layout_V);
+    DTypeV* V_ptr_base = mainloop_params.V_ptr + kv_head_idx * stride<2>(mainloop_params.layout_V);
     IdType const* kv_indices_ptr = mainloop_params.kv_indices + kv_indptr;
     // Use the page stride (stride between pages) and stride within page
     int64_t k_page_stride = mainloop_params.k_page_stride;
@@ -338,6 +343,65 @@ struct SparseCollectiveMainloop {
       }
     };
 
+    // Asymmetric K/V (16-bit K, FP8 V): load FP8 V from global memory,
+    // dequantize to DTypeKV (16-bit) in registers, and store into the 16-bit V
+    // shared-memory tile the PV WGMMA reads.  Addressing mirrors
+    // load_kv_with_gather (page/entry element offsets are identical for K and V
+    // on a same-shape paged cache), but the cp.async 16-byte copy is replaced by
+    // a synchronous FP8 LDG + convert + 16-bit STS.  Numerically identical to the
+    // FA2 path's smem->register FP8 dequant, moved to the load side because the
+    // Hopper PV WGMMA reads its V operand directly from shared memory.
+    auto load_v_with_gather_dequant = [&](auto&& tVsV, auto&& tVcV, DTypeV* base_ptr,
+                                          int kv_tile_idx, int stage_idx, bool use_predicate) {
+      using VecOut = AlignmentTypeKV;                            // 16 bytes == 8 x DTypeKV
+      constexpr int VecSize = sizeof(VecOut) / sizeof(DTypeKV);  // 8 elements per vector
+      int kv_base_idx = kv_tile_idx * CTA_KV;
+      auto dst = recast<VecOut>(flatten(tVsV(_, _, _, stage_idx)));  // 16-bit smem destination
+      auto c = flatten(tVcV(_, _, _, kv_tile_idx));
+      constexpr unsigned FULL_MASK = 0xffffffff;
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(dst); ++i) {
+        auto coord = c(VecSize * i);
+        int kv_offset = get<0>(coord);
+        int d_idx = get<1>(coord);
+        int kv_idx = kv_base_idx + kv_offset;
+        bool guard = !use_predicate || kv_idx < kv_len;
+        int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
+        int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[parity], src_thread);
+        // Load VecSize FP8 elements (== 8 bytes) as one aligned uint2; zero-fill
+        // out-of-bound rows (matches cp_async_zfill). Using aligned uint2/VecOut
+        // temporaries avoids misaligned reinterprets of 1-byte-aligned arrays.
+        uint2 packed = make_uint2(0u, 0u);
+        if (guard) {
+          packed = *reinterpret_cast<const uint2*>(base_ptr + base_offset + d_idx);
+        }
+        const DTypeV* src_reg = reinterpret_cast<const DTypeV*>(&packed);
+        VecOut out_vec;
+        DTypeKV* dst_reg = reinterpret_cast<DTypeKV*>(&out_vec);
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < VecSize; ++j) {
+          dst_reg[j] = static_cast<DTypeKV>(static_cast<float>(src_reg[j]));
+        }
+        dst(i) = out_vec;
+      }
+    };
+
+    // Unified V load+commit for one tile: dequantize-from-FP8 for asymmetric K/V,
+    // plain cp.async for symmetric.  Asymmetric writes V synchronously (LDG+STS),
+    // so it commits with a plain producer_commit (as the FP8 transpose path does),
+    // not the cp.async barrier arrival.
+    auto do_v_load = [&](int tile, bool pred) {
+      pipeline_v.producer_acquire(smem_pipe_write_v);
+      if constexpr (IS_ASYM) {
+        load_v_with_gather_dequant(tVsV, tVcV, V_ptr_base, tile, smem_pipe_write_v.index(), pred);
+        pipeline_v.producer_commit(smem_pipe_write_v);
+      } else {
+        load_kv_with_gather(tVsV, tVcV, V_ptr_base, tile, smem_pipe_write_v.index(), pred);
+        pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
+      }
+      ++smem_pipe_write_v;
+    };
+
     // load last k-tile
     // parity=0: prefetch kv_tile_idx -> my_kv_offset[0]
     {
@@ -370,10 +434,7 @@ struct SparseCollectiveMainloop {
 
     if (kv_tile_idx == swa_begin_kv_tile_idx) {
       // kv_tile_idx already prefetched above (parity=0), reuse it for V
-      pipeline_v.producer_acquire(smem_pipe_write_v);
-      load_kv_with_gather(tVsV, tVcV, V_ptr_base, kv_tile_idx, smem_pipe_write_v.index(), true);
-      pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
-      ++smem_pipe_write_v;
+      do_v_load(kv_tile_idx, true);
     } else {
       // load second last k-tile and last v-tile
       // parity=0: kv_tile_idx is in my_kv_offset[0]
@@ -388,11 +449,8 @@ struct SparseCollectiveMainloop {
 
       // Load V for kv_tile_idx using my_kv_offset[0]
       parity ^= 1;  // parity=0
-      pipeline_v.producer_acquire(smem_pipe_write_v);
-      load_kv_with_gather(tVsV, tVcV, V_ptr_base, kv_tile_idx, smem_pipe_write_v.index(), true);
-      pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
+      do_v_load(kv_tile_idx, true);
       kv_tile_idx = kv_tile_idx_decrement(kv_tile_idx);
-      ++smem_pipe_write_v;
       // Now kv_tile_idx == kv_tile_k, and its offset is in my_kv_offset[1]
       parity ^= 1;  // parity=1, pointing to kv_tile_idx's offset
 
@@ -412,10 +470,7 @@ struct SparseCollectiveMainloop {
 
         // Load V for kv_tile_idx using the previous buffer
         parity ^= 1;  // Toggle back to kv_tile_idx's buffer
-        pipeline_v.producer_acquire(smem_pipe_write_v);
-        load_kv_with_gather(tVsV, tVcV, V_ptr_base, kv_tile_idx, smem_pipe_write_v.index(), false);
-        pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
-        ++smem_pipe_write_v;
+        do_v_load(kv_tile_idx, false);
         // After loop update, kv_tile_idx becomes kv_tile_k
         // Toggle parity to point to kv_tile_k's buffer for next iteration
         parity ^= 1;
@@ -425,10 +480,7 @@ struct SparseCollectiveMainloop {
       // load first v tile (tile 0)
       {
         prefetch_kv_offset(0, false);
-        pipeline_v.producer_acquire(smem_pipe_write_v);
-        load_kv_with_gather(tVsV, tVcV, V_ptr_base, 0, smem_pipe_write_v.index(), false);
-        pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
-        ++smem_pipe_write_v;
+        do_v_load(0, false);
       }
     }
 
