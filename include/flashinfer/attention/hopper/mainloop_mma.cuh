@@ -18,11 +18,11 @@ namespace flashinfer {
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool MULTIITEMSCORING,
           typename WarpScheduler, typename AttentionVariant, typename Params,
-          typename MainloopPipeline, typename PipelineState, typename SharedStorage,
-          typename FrgTensorO, typename AttentionUpdater>
+          typename MainloopPipelineK, typename MainloopPipelineV, typename PipelineState,
+          typename SharedStorage, typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_f16(
-    const Params& mainloop_params, AttentionVariant& variant, MainloopPipeline pipeline_k,
-    MainloopPipeline pipeline_v, PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
+    const Params& mainloop_params, AttentionVariant& variant, MainloopPipelineK pipeline_k,
+    MainloopPipelineV pipeline_v, PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
     FrgTensorO& tOrO, AttentionUpdater& attention_updater, int kv_tile_idx_count,
     int swa_begin_kv_tile_idx, int swa_end_kv_tile_idx, int thread_idx, int work_idx,
     int q_tile_idx, SharedStorage& shared_storage, const int32_t qo_len, const int32_t kv_len,

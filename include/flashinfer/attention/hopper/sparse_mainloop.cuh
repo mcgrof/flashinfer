@@ -94,9 +94,14 @@ struct SparseCollectiveMainloop {
   // Verify NUM_PRODUCER_THREADS matches NUM_COPY_THREADS for sparse loading
   static_assert(Ktraits::NUM_PRODUCER_THREADS == NUM_COPY_THREADS,
                 "NUM_PRODUCER_THREADS must equal NUM_COPY_THREADS for sparse/paged KV loading");
-  using MainloopPipeline = typename Ktraits::MainloopPipeline;
+  // Paged/sparse loading is cp.async for both K and V (USE_TMA_LOAD_KV == false),
+  // so MainloopPipelineK == MainloopPipelineV == PipelineAsync here. The split is
+  // to match the shared kernel body signature (ragged/single may differ for asym).
+  using MainloopPipelineK = typename Ktraits::MainloopPipelineK;
+  using MainloopPipelineV = typename Ktraits::MainloopPipelineV;
+  using MainloopPipeline = MainloopPipelineK;  // back-compat alias
   using PipelineParams = typename MainloopPipeline::Params;
-  using PipelineState = typename MainloopPipeline::PipelineState;
+  using PipelineState = typename Ktraits::PipelineState;
 
   static constexpr uint32_t TmaTransactionBytesQ =
       static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<DTypeQ> / 8);
@@ -180,8 +185,8 @@ struct SparseCollectiveMainloop {
 
   template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
             typename SharedStorage>
-  CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
-                           MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
+  CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipelineK pipeline_k,
+                           MainloopPipelineV pipeline_v, PipelineState& smem_pipe_write_k,
                            PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
                            Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
@@ -487,7 +492,7 @@ struct SparseCollectiveMainloop {
     scheduler.broadcast_next_work(work_tile_info);
   }
 
-  CUTLASS_DEVICE void load_tail(MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
+  CUTLASS_DEVICE void load_tail(MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v,
                                 PipelineState& smem_pipe_write_k,
                                 PipelineState& smem_pipe_write_v) {
     pipeline_k.producer_tail(smem_pipe_write_k);

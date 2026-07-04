@@ -22,8 +22,9 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename MainloopPipeline, class DTypeQ, class DTypeKV, class DTypeOut, class IdType,
-          int CTA_KV, class SmemLayoutQ, class SmemLayoutK, class SmemLayoutV, class SmemLayoutO>
+template <typename MainloopPipelineK, typename MainloopPipelineV, class DTypeQ, class DTypeKV,
+          class DTypeOut, class IdType, int CTA_KV, class SmemLayoutQ, class SmemLayoutK,
+          class SmemLayoutV, class SmemLayoutO>
 struct SharedStorageQKVO {
   cute::array_aligned<DTypeQ, cute::cosize_v<SmemLayoutQ>> smem_q;
   cute::array_aligned<DTypeKV, cute::cosize_v<SmemLayoutK>> smem_k;
@@ -34,8 +35,11 @@ struct SharedStorageQKVO {
   struct {
     cutlass::arch::ClusterTransactionBarrier barrier_Q;
     cutlass::arch::ClusterBarrier barrier_O;
-    typename MainloopPipeline::SharedStorage pipeline_k;
-    typename MainloopPipeline::SharedStorage pipeline_v;
+    // pipeline_k and pipeline_v may use different pipeline types for asymmetric
+    // K/V under TMA (K on TMA, V on cp.async). For symmetric builds both are the
+    // same type, so this is byte-identical to a single-type layout.
+    typename MainloopPipelineK::SharedStorage pipeline_k;
+    typename MainloopPipelineV::SharedStorage pipeline_v;
   };
 };
 
@@ -117,13 +121,28 @@ struct AttentionKernelTraits {
                                    GMMA::Major::K, DTypeO, decltype(cute::get<0>(TileShape_PDV{})),
                                    decltype(cute::get<1>(TileShape_PDV{}))>());
   using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 1>(TileShape_PDV{})));
-  using MainloopPipeline =
+  // Asymmetric K/V: K is 16-bit, V is FP8 (DTypeV != DTypeKV). TMA cannot
+  // dtype-convert, so for asymmetric K/V under TMA the V tile is loaded via
+  // cp.async (PipelineAsync) and dequantized FP8->16-bit in the producer, while
+  // K keeps its fast TMA path (PipelineTmaAsync). Symmetric builds keep V == K,
+  // so MainloopPipelineV == MainloopPipelineK and everything below is
+  // byte-identical (same JIT URI, same smem layout, same instructions).
+  static constexpr bool IS_ASYM = !std::is_same_v<DTypeKV, DTypeV>;
+  using MainloopPipelineK =
       std::conditional_t<USE_TMA_LOAD_KV, typename cutlass::PipelineTmaAsync<NUM_STAGES>,
                          typename cutlass::PipelineAsync<NUM_STAGES>>;
+  using MainloopPipelineV =
+      std::conditional_t<USE_TMA_LOAD_KV && !IS_ASYM,
+                         typename cutlass::PipelineTmaAsync<NUM_STAGES>,
+                         typename cutlass::PipelineAsync<NUM_STAGES>>;
+  // Backwards-compatible alias (the K-side pipeline); new code should prefer
+  // MainloopPipelineK / MainloopPipelineV explicitly.
+  using MainloopPipeline = MainloopPipelineK;
   using PipelineState = typename cutlass::PipelineState<NUM_STAGES>;
 
-  using SharedStorage = SharedStorageQKVO<MainloopPipeline, DTypeQ, DTypeKV, DTypeO, IdType, CTA_KV,
-                                          SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
+  using SharedStorage =
+      SharedStorageQKVO<MainloopPipelineK, MainloopPipelineV, DTypeQ, DTypeKV, DTypeO, IdType,
+                        CTA_KV, SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutO>;
 };
 
 }  // namespace flashinfer
