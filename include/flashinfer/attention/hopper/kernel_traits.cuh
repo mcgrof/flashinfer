@@ -41,12 +41,19 @@ struct SharedStorageQKVO {
 
 template <bool USE_TMA_LOAD_KV, int HEAD_DIM_QK_, int HEAD_DIM_VO_, int CTA_Q_, int CTA_KV_,
           int NUM_STAGES_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
-          typename AttentionVariant_>
+          typename AttentionVariant_, typename DTypeV_ = DTypeKV_>
 struct AttentionKernelTraits {
   using AttentionVariant = AttentionVariant_;
 
   using DTypeQ = DTypeQ_;
+  // DTypeKV is the key-side dtype (and, in the symmetric case, the value dtype
+  // too). DTypeK is an explicit alias for it; DTypeV is the value-side dtype,
+  // which may differ for asymmetric K/V (e.g. K bf16 / V fp8). DTypeV_ defaults
+  // to DTypeKV_, so symmetric builds have DTypeK == DTypeV == DTypeKV and this
+  // change is byte-identical (same JIT URI, same smem/MMA instantiations).
   using DTypeKV = DTypeKV_;
+  using DTypeK = DTypeKV_;
+  using DTypeV = DTypeV_;
   using DTypeO = DTypeO_;
   using IdType = IdType_;
   using DTypeQKAccum = float;
