@@ -169,14 +169,18 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }
 
   if (warp_group_idx == 0) {  // Producer
-    if constexpr (use_tma_load_kv) {
+    if constexpr (use_tma_load_kv && !Ktraits::IS_ASYM) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
     } else {
+      // Asymmetric K/V (and the paged path) run a full-warpgroup producer that
+      // dequantizes FP8 V, which needs more registers than the TMA-only producer.
       cutlass::arch::warpgroup_reg_dealloc<72>();
     }
 
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
-    if (!use_tma_load_kv || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
+    // For asymmetric K/V the whole producer warpgroup loads/dequantizes FP8 V, so
+    // all warps enter (K TMA stays restricted to the leader thread inside load()).
+    if (!use_tma_load_kv || Ktraits::IS_ASYM || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
       PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipelineK>();
       PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipelineV>();
 
@@ -226,7 +230,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
     }
   } else {  // Consumer
-    if constexpr (use_tma_load_kv) {
+    if constexpr (use_tma_load_kv && !Ktraits::IS_ASYM) {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
     } else {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 216 : 144>();
@@ -551,30 +555,28 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  // Asymmetric K/V (16-bit K, FP8 V) is not yet supported on the single/ragged
-  // SM90 prefill paths: they use TMA loads, which cannot dtype-convert V during
-  // the copy. Only the paged path implements it. Fail closed at *runtime* (not a
-  // static_assert) so the shared JIT module (paged + ragged + single kernels)
-  // still compiles for asymmetric dtypes without instantiating the TMA mainloop
-  // with a mismatched V dtype.
-  if constexpr (!std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>) {
-    return cudaErrorNotSupported;
-  } else {
-    if (MASK_MODE == MaskMode::kCustom) {
-      return cudaErrorNotSupported;  // Not supported yet.
-    }
-    constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-    constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
-    SinglePrefillWithKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
-                              /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant,
-                              typename Params::DTypeV>,
-        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
-    return cudaGetLastError();
+  // SM90 single prefill supports symmetric K/V and asymmetric 16-bit K + FP8 V.
+  // For asymmetric K/V the producer dequantizes FP8 V -> 16-bit into smem via
+  // cp.async (TMA cannot dtype-convert); K keeps its TMA fast path. Anything else
+  // fails closed.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV> ||
+                    (sizeof(typename Params::DTypeK) == 2 && sizeof(typename Params::DTypeV) == 1),
+                "SM90 SinglePrefillWithKVCacheDispatched supports symmetric K/V "
+                "or asymmetric 16-bit K + FP8 V only");
+  if (MASK_MODE == MaskMode::kCustom) {
+    return cudaErrorNotSupported;  // Not supported yet.
   }
+  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+  SinglePrefillWithKVCacheKernelTraitsDispatched<
+      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                            typename Params::DTypeO, typename Params::IdType, AttentionVariant,
+                            typename Params::DTypeV>,
+      LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+  return cudaGetLastError();
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
@@ -582,27 +584,28 @@ template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool L
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_pdl,
                                                     cudaStream_t stream) {
   static_assert(HEAD_DIM_VO == 64 || HEAD_DIM_VO == 128 || HEAD_DIM_VO == 256);
-  // Asymmetric K/V not yet supported on the ragged (TMA) SM90 prefill path; fail
-  // closed at runtime so the shared JIT module still compiles (see the single
-  // path above for the rationale). Only the paged path implements asymmetric K/V.
-  if constexpr (!std::is_same_v<typename Params::DTypeK, typename Params::DTypeV>) {
-    return cudaErrorNotSupported;
-  } else {
-    if (MASK_MODE == MaskMode::kCustom) {
-      return cudaErrorNotSupported;  // Not supported yet.
-    }
-    constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-    constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
-    BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
-                              /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant,
-                              typename Params::DTypeV>,
-        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-    return cudaGetLastError();
+  // SM90 ragged prefill supports symmetric K/V and asymmetric 16-bit K + FP8 V.
+  // For asymmetric K/V the producer dequantizes FP8 V -> 16-bit into smem via
+  // cp.async (TMA cannot dtype-convert); K keeps its TMA fast path. Anything else
+  // fails closed.
+  static_assert(std::is_same_v<typename Params::DTypeK, typename Params::DTypeV> ||
+                    (sizeof(typename Params::DTypeK) == 2 && sizeof(typename Params::DTypeV) == 1),
+                "SM90 BatchPrefillWithRaggedKVCacheDispatched supports symmetric K/V "
+                "or asymmetric 16-bit K + FP8 V only");
+  if (MASK_MODE == MaskMode::kCustom) {
+    return cudaErrorNotSupported;  // Not supported yet.
   }
+  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+  BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                            typename Params::DTypeO, typename Params::IdType, AttentionVariant,
+                            typename Params::DTypeV>,
+      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  return cudaGetLastError();
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
