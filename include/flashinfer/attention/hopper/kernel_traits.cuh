@@ -62,6 +62,11 @@ struct AttentionKernelTraits {
   using IdType = IdType_;
   using DTypeQKAccum = float;
 
+  // Asymmetric K/V: 16-bit K, FP8 V (DTypeV != DTypeKV). See MainloopPipelineV
+  // below and mainloop.cuh for how V is loaded via cp.async + FP8->16-bit
+  // dequant on the ragged/single TMA path.
+  static constexpr bool IS_ASYM = !std::is_same_v<DTypeKV, DTypeV>;
+
   static constexpr int CTA_Q = CTA_Q_;
   static_assert(CTA_Q % 64 == 0);
   static constexpr int CTA_KV = CTA_KV_;
@@ -74,8 +79,12 @@ struct AttentionKernelTraits {
   static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
   // NOTE(Zihao): the following constant should only be used when TMA is enabled,
   // where only one warp inside a warp group is used for TMA.
+  // For asymmetric K/V under TMA, K still uses a single TMA warp but V is loaded
+  // by the full producer warpgroup (each thread dequantizes its FP8 V slice into
+  // 16-bit smem via cp.async), so the whole producer warpgroup participates.
   static constexpr int NUM_PRODUCER_THREADS =
-      USE_TMA_LOAD_KV ? cutlass::NumThreadsPerWarp : 4 * cutlass::NumThreadsPerWarp;
+      USE_TMA_LOAD_KV ? (IS_ASYM ? cutlass::NumThreadsPerWarpGroup : cutlass::NumThreadsPerWarp)
+                      : 4 * cutlass::NumThreadsPerWarp;
 
   using TileShape_QKD = Shape<Int<CTA_Q>, Int<CTA_KV>, Int<HEAD_DIM_QK>>;
   using TileShape_PDV = Shape<Int<CTA_Q>, Int<HEAD_DIM_VO>, Int<CTA_KV>>;
@@ -127,7 +136,6 @@ struct AttentionKernelTraits {
   // K keeps its fast TMA path (PipelineTmaAsync). Symmetric builds keep V == K,
   // so MainloopPipelineV == MainloopPipelineK and everything below is
   // byte-identical (same JIT URI, same smem layout, same instructions).
-  static constexpr bool IS_ASYM = !std::is_same_v<DTypeKV, DTypeV>;
   using MainloopPipelineK =
       std::conditional_t<USE_TMA_LOAD_KV, typename cutlass::PipelineTmaAsync<NUM_STAGES>,
                          typename cutlass::PipelineAsync<NUM_STAGES>>;
