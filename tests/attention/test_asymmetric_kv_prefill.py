@@ -698,6 +698,52 @@ def test_single_prefill_asymmetric_hd512_fails_closed():
         flashinfer.single_prefill_with_kv_cache(q, k, v)
 
 
+def test_asym_prefill_backend_guard_helper():
+    """The prefill backend guard rejects asymmetric K/V on any backend other than
+    fa2/fa3/auto (which would compile a symmetric kernel and silently reinterpret
+    FP8 V as the K dtype), and never rejects symmetric K/V. Pure-Python check of
+    the guard the plan()/workspace_size()/single-prefill paths all call."""
+    from flashinfer.prefill import _check_asym_prefill_backend
+
+    all_backends = ["fa2", "fa3", "auto", "cutlass", "cudnn", "trtllm-gen", "cute-dsl"]
+    # Symmetric K/V: never rejected, regardless of backend.
+    for b in all_backends:
+        _check_asym_prefill_backend(b, torch.bfloat16, torch.bfloat16)
+    # Asymmetric K/V: allowed only on the fa2/fa3 kernels (auto resolves to them).
+    for b in ["fa2", "fa3", "auto"]:
+        _check_asym_prefill_backend(b, torch.bfloat16, torch.float8_e4m3fn)
+    for b in ["cutlass", "cudnn", "trtllm-gen", "cute-dsl"]:
+        with pytest.raises(NotImplementedError, match=r"fa2"):
+            _check_asym_prefill_backend(b, torch.bfloat16, torch.float8_e4m3fn)
+
+
+def test_batch_prefill_ragged_asymmetric_rejects_nonfa_backend():
+    """End-to-end guard wiring: constructing the ragged prefill wrapper with a
+    non-fa2/fa3 backend and planning an asymmetric K/V request must fail closed at
+    plan() — before any backend-specific kernel is built — not silently run a
+    symmetric kernel over the FP8 V cache. Uses the in-tree 'cutlass' backend so
+    the check is exercised without an optional runtime dependency, and raises
+    regardless of GPU arch (the guard runs before SM100 dispatch)."""
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="cutlass"
+    )
+    qo_indptr = torch.tensor([0, 32], device="cuda:0", dtype=torch.int32)
+    kv_indptr = torch.tensor([0, 64], device="cuda:0", dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match=r"fa2"):
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            num_qo_heads=32,
+            num_kv_heads=4,
+            head_dim_qk=128,
+            causal=False,
+            q_data_type=torch.bfloat16,
+            k_data_type=torch.bfloat16,
+            v_data_type=torch.float8_e4m3fn,
+        )
+
+
 def test_workspace_size_accepts_asymmetric():
     """workspace_size() accepts k_data_type/v_data_type and returns a sane
     (float, int) byte tuple for an asymmetric plan (querying the same module the

@@ -313,6 +313,25 @@ def get_trtllm_gen_prefill_module():
     )
 
 
+# Asymmetric K/V (16-bit K + FP8 V) prefill is implemented only in the fa2 and
+# fa3 kernels. Any other backend (cutlass, cudnn, trtllm-gen, cute-dsl) would
+# compile a symmetric-KV kernel keyed on a single dtype and then silently
+# reinterpret the FP8 V cache as the K dtype -- wrong numbers, no error. Fail
+# closed here the same way the decode wrapper does. "auto" is safe: it resolves
+# to fa2/fa3 (determine_attention_backend never returns another backend).
+_ASYM_PREFILL_BACKENDS = ("fa2", "fa3", "auto")
+
+
+def _check_asym_prefill_backend(backend, k_data_type, v_data_type) -> None:
+    if k_data_type != v_data_type and backend not in _ASYM_PREFILL_BACKENDS:
+        raise NotImplementedError(
+            f"asymmetric K/V prefill (k_data_type {k_data_type} != v_data_type "
+            f"{v_data_type}) is only implemented for the 'fa2'/'fa3' backends; "
+            f"backend {backend!r} would compile a symmetric kernel and silently "
+            "reinterpret the FP8 V cache as the K dtype. Use 'fa2', 'fa3', or 'auto'."
+        )
+
+
 @functools.cache
 def get_single_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
     uri = get_single_prefill_uri(backend, *args, dtype_k=dtype_k, dtype_v=dtype_v)
@@ -1378,6 +1397,7 @@ def single_prefill_with_kv_cache(
             q.dtype,
             k.dtype,
         )
+    _check_asym_prefill_backend(backend, k.dtype, v.dtype)
 
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
@@ -1892,6 +1912,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"head_dim <= 256, got head_dim_qk={head_dim_qk}, head_dim_vo="
                 f"{head_dim_vo if head_dim_vo is not None else head_dim_qk}."
             )
+        _check_asym_prefill_backend(self._backend, k_data_type, v_data_type)
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -2199,6 +2220,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"head_dim <= 256, got head_dim_qk={head_dim_qk}, head_dim_vo="
                 f"{head_dim_vo if head_dim_vo is not None else head_dim_qk}."
             )
+        _check_asym_prefill_backend(self._backend, k_data_type, v_data_type)
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -3348,6 +3370,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 f"head_dim <= 256, got head_dim_qk={head_dim_qk}, head_dim_vo="
                 f"{head_dim_vo if head_dim_vo is not None else head_dim_qk}."
             )
+        _check_asym_prefill_backend(self._backend, k_data_type, v_data_type)
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
