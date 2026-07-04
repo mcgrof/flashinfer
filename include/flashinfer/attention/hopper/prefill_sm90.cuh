@@ -544,7 +544,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                            typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+                            typename Params::DTypeO, typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
       LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
@@ -569,7 +569,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, bool enable_
                             /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
                             /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                            typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+                            typename Params::DTypeO, typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
       LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
@@ -598,7 +598,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*CTA_KV_=*/96,
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
-                                typename Params::IdType, AttentionVariant>,
+                                typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
           LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     } else if constexpr (HEAD_DIM_VO == 128) {
@@ -608,7 +608,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*CTA_KV_=*/96,
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
-                                typename Params::IdType, AttentionVariant>,
+                                typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
           LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     } else {
@@ -620,7 +620,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
                                 /*CTA_KV_=*/32,
                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
                                 typename Params::DTypeKV, typename Params::DTypeO,
-                                typename Params::IdType, AttentionVariant>,
+                                typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
           LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     }
