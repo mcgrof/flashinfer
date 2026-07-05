@@ -1862,6 +1862,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
 
+        .. note::
+            ``workspace_size`` is only implemented for the ``fa2`` prefill
+            backend, which sizes fa2's split-KV plan.  The ``fa3``/SM90 and
+            ``cudnn`` backends do not export this query, so this method raises
+            :class:`NotImplementedError` for them -- including when a wrapper
+            built with the default ``backend="auto"`` resolves to ``fa3`` (e.g.
+            on SM90/Hopper).  Construct the wrapper with ``backend="fa2"`` to
+            size a caller-owned workspace on any supported architecture.
+
         Example
         -------
         >>> float_bytes, int_bytes = wrapper.workspace_size(...)
