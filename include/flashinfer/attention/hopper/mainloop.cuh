@@ -327,21 +327,33 @@ struct CollectiveMainloop {
         int kv_base_idx = tile * CTA_KV;
         auto dst = recast<VecOut>(flatten(tVsV_dq(_, _, _, stage_idx)));  // 16-bit smem dest
         auto c = flatten(tVcV_dq(_, _, _, tile));
+        constexpr int NVEC = size(dst);
+        // Two-phase dequant, mirroring TMA's async-then-consume shape as closely
+        // as a thread-driven load can: issue ALL NVEC global loads up front into
+        // registers (phase 1), then convert FP8->16-bit and store to smem (phase
+        // 2). The producer here is a dedicated load warpgroup, so front-loading
+        // every load maximizes in-flight memory-level parallelism and shortens
+        // the exposed per-tile latency vs interleaving load/convert/store (whose
+        // dependency chain can serialize the scoreboard waits). See PERF note in
+        // the asymmetric V-load design doc.
+        uint2 packed[NVEC];
         CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(dst); ++i) {
+        for (int i = 0; i < NVEC; ++i) {
           auto coord = c(VecSize * i);
-          int kv_offset = get<0>(coord);
+          int kv_idx = kv_base_idx + get<0>(coord);
           int d_idx = get<1>(coord);
-          int kv_idx = kv_base_idx + kv_offset;
           bool guard = !use_predicate || kv_idx < kv_len;
           int64_t off = static_cast<int64_t>(kv_idx) * v_stride_n + static_cast<int64_t>(d_idx);
           // Load VecSize FP8 elements (== 8 bytes) as one aligned uint2; zero-fill
           // out-of-bound rows (softmax masks them out anyway; zero avoids NaN*0).
-          uint2 packed = make_uint2(0u, 0u);
+          packed[i] = make_uint2(0u, 0u);
           if (guard) {
-            packed = *reinterpret_cast<const uint2*>(V_base + off);
+            packed[i] = *reinterpret_cast<const uint2*>(V_base + off);
           }
-          const DTypeV* src_reg = reinterpret_cast<const DTypeV*>(&packed);
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < NVEC; ++i) {
+          const DTypeV* src_reg = reinterpret_cast<const DTypeV*>(&packed[i]);
           VecOut out_vec;
           DTypeKV* dst_reg = reinterpret_cast<DTypeKV*>(&out_vec);
           CUTLASS_PRAGMA_UNROLL
