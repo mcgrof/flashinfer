@@ -898,9 +898,17 @@ def test_batch_prefill_ragged_asymmetric_rejects_nonfa_backend():
 
 
 def test_workspace_size_accepts_asymmetric():
-    """workspace_size() accepts k_data_type/v_data_type and returns a sane
-    (float, int) byte tuple for an asymmetric plan (querying the same module the
-    plan will use), and fails closed for head_dim > 256 just like plan()."""
+    """workspace_size() threads k_data_type/v_data_type for an asymmetric plan and
+    returns a sane (float, int) byte tuple, and fails closed for head_dim > 256 the
+    way plan() does.
+
+    workspace_size() is an FA2-path query: upstream (#3741) wired it through the
+    FA2 scheduler only, so the SM90/fa3 batch-prefill binding exports no
+    workspace_size and backend="auto" -- which resolves to fa3 on Hopper -- would
+    raise NotImplementedError there. Pin backend="fa2" (the CUDA-core kernel runs
+    on every supported arch, SM90 included), mirroring upstream's own
+    workspace_size test, so this exercises the asymmetric dtype threading
+    arch-independently instead of only where "auto" happens to pick fa2."""
     batch, kv_len, qo_len, page_size = 4, 64, 16, 16
     ppq = (kv_len + page_size - 1) // page_size
     qo_indptr = torch.arange(0, batch + 1, device="cuda:0", dtype=torch.int32) * qo_len
@@ -908,7 +916,9 @@ def test_workspace_size_accepts_asymmetric():
     kv_indices = torch.arange(0, ppq * batch, device="cuda:0", dtype=torch.int32)
     kv_last = torch.full((batch,), page_size, dtype=torch.int32, device="cuda:0")
     wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"), "NHD"
+        torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"),
+        "NHD",
+        backend="fa2",
     )
     fb, ib = wrapper.workspace_size(
         qo_indptr,
@@ -927,6 +937,9 @@ def test_workspace_size_accepts_asymmetric():
     assert isinstance(fb, int) and isinstance(ib, int)
     assert fb >= 0 and ib >= 0
 
+    # head_dim > 256 asymmetric fails closed before any module is built (the same
+    # VO-split fail-close plan() enforces; the check runs ahead of backend
+    # resolution, so it fires regardless of the pinned backend).
     with pytest.raises(NotImplementedError, match=r"head_dim <= 256"):
         wrapper.workspace_size(
             qo_indptr,
