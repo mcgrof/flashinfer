@@ -91,7 +91,11 @@ def warmup_jit():
 @pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
+# 28 -> group_size 7 (Qwen2.5-7B: 28 query / 4 kv heads). Exercises the
+# CUDA-core decode dispatch for GQA groups 5/6/7 added to
+# DISPATCH_GQA_GROUP_SIZE; before that change group_size 7 raised
+# "Unsupported group_size". 4 -> group 1, 32 -> group 8 (unchanged coverage).
+@pytest.mark.parametrize("num_qo_heads", [4, 28, 32])
 @pytest.mark.parametrize("head_dim", [128, 256, 512])
 @pytest.mark.parametrize("kv_layout", ["NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
@@ -526,7 +530,8 @@ def test_batch_decode_with_tuple_paged_kv_cache(
 @pytest.mark.parametrize("kv_len", [54, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
+# 28 -> group_size 7 (Qwen2.5-7B), here also under CUDA graph capture.
+@pytest.mark.parametrize("num_qo_heads", [4, 28, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
