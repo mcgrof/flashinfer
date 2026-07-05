@@ -364,8 +364,18 @@ struct SparseCollectiveMainloop {
       auto dst = recast<VecOut>(flatten(tVsV(_, _, _, stage_idx)));  // 16-bit smem destination
       auto c = flatten(tVcV(_, _, _, kv_tile_idx));
       constexpr unsigned FULL_MASK = 0xffffffff;
+      constexpr int NVEC = size(dst);
+      // Two-phase dequant (see mainloop.cuh load_v_dequant for the rationale):
+      // issue ALL NVEC gathered global loads up front into registers (phase 1,
+      // including the per-vector __shfl that resolves the page-table offset),
+      // then convert FP8->16-bit and store to smem (phase 2). Front-loading the
+      // loads maximizes in-flight memory-level parallelism on this dedicated
+      // producer warpgroup and shortens the exposed per-tile latency vs
+      // interleaving load/convert/store (measured ~40% faster on the ragged
+      // sibling path; the gather here is even more latency-sensitive).
+      uint2 packed[NVEC];
       CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size(dst); ++i) {
+      for (int i = 0; i < NVEC; ++i) {
         auto coord = c(VecSize * i);
         int kv_offset = get<0>(coord);
         int d_idx = get<1>(coord);
@@ -376,11 +386,14 @@ struct SparseCollectiveMainloop {
         // Load VecSize FP8 elements (== 8 bytes) as one aligned uint2; zero-fill
         // out-of-bound rows (matches cp_async_zfill). Using aligned uint2/VecOut
         // temporaries avoids misaligned reinterprets of 1-byte-aligned arrays.
-        uint2 packed = make_uint2(0u, 0u);
+        packed[i] = make_uint2(0u, 0u);
         if (guard) {
-          packed = *reinterpret_cast<const uint2*>(base_ptr + base_offset + d_idx);
+          packed[i] = *reinterpret_cast<const uint2*>(base_ptr + base_offset + d_idx);
         }
-        const DTypeV* src_reg = reinterpret_cast<const DTypeV*>(&packed);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < NVEC; ++i) {
+        const DTypeV* src_reg = reinterpret_cast<const DTypeV*>(&packed[i]);
         VecOut out_vec;
         DTypeKV* dst_reg = reinterpret_cast<DTypeKV*>(&out_vec);
         CUTLASS_PRAGMA_UNROLL
