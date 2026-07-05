@@ -128,7 +128,12 @@ def _ref_prefill(q, k, v, sm_scale, causal):
     return torch.einsum("hqk,khd->qhd", p, v.float())  # [Lq, H_qo, D]
 
 
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
+# num_qo_heads=28 with num_kv_heads=4 is GQA group_size=7 — the Qwen2.5-7B
+# ratio. The prefill kernel carries group_size as a runtime uint_fastdiv (no
+# DISPATCH_GQA_GROUP_SIZE power-of-two cap), so 7 rides through the same path
+# as 1 and 8; this cell is the explicit guard that the "group-7 free" claim
+# holds for asymmetric K/V, not just symmetric.
+@pytest.mark.parametrize("num_qo_heads", [4, 28, 32])
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("causal", [True, False])
@@ -279,7 +284,10 @@ def test_batch_prefill_paged_asymmetric_shapes(page_size, kv_len, qo_len, batch_
     )
 
 
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
+# num_qo_heads=28 / num_kv_heads=4 = GQA group_size=7 (Qwen2.5-7B). See the
+# note on the paged test: group-7 is not special-cased, it rides the runtime
+# uint_fastdiv path. Ragged is the layout vLLM's asym prefill actually uses.
+@pytest.mark.parametrize("num_qo_heads", [4, 28, 32])
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("k_dtype", K_DTYPES)
