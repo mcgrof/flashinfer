@@ -188,6 +188,22 @@ def parse_attention_args(line, parser):
         help="Data type of the key and value. Currently only bfloat16 is supported.",
     )
     parser.add_argument(
+        "--k_dtype",
+        type=str,
+        required=False,
+        default=None,
+        help="Data type of the K cache. Defaults to --kv_dtype. Set != --v_dtype "
+        "for asymmetric K/V (16-bit K + FP8 V), e.g. --k_dtype bfloat16 --v_dtype fp8_e4m3.",
+    )
+    parser.add_argument(
+        "--v_dtype",
+        type=str,
+        required=False,
+        default=None,
+        help="Data type of the V cache. Defaults to --kv_dtype. Set != --k_dtype "
+        "for asymmetric K/V (16-bit K + FP8 V).",
+    )
+    parser.add_argument(
         "--out_dtype",
         type=str,
         required=False,
@@ -922,6 +938,35 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
 
+    # Asymmetric K/V: --k_dtype/--v_dtype independently override the K and V cache
+    # dtype (both default to --kv_dtype, so symmetric runs are byte-identical).
+    # Only 16-bit K (bf16/fp16) + FP8 V (e4m3/e5m2), head_dim <= 256, fa2/fa3.
+    k_dtype = dtype_str_to_torch_dtype(args.k_dtype) if args.k_dtype else kv_dtype
+    v_dtype = dtype_str_to_torch_dtype(args.v_dtype) if args.v_dtype else kv_dtype
+    is_asym_kv = k_dtype != v_dtype
+    if is_asym_kv:
+        if k_dtype not in (torch.bfloat16, torch.float16) or v_dtype not in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            print(
+                f"[ERROR] Asymmetric K/V only supports 16-bit K (bf16/fp16) + FP8 V "
+                f"(e4m3/e5m2), got k_dtype={k_dtype}, v_dtype={v_dtype}. Exiting."
+            )
+            return res
+        if head_dim_qk > 256 or (head_dim_vo or head_dim_qk) > 256:
+            print("[ERROR] Asymmetric K/V requires head_dim <= 256. Exiting.")
+            return res
+        rtol, atol = 5e-1, 1e-1  # FP8 V → relax like the symmetric FP8 path
+        # Only fa2/fa3 implement asymmetric K/V; the others fail closed in the
+        # kernel API, so drop them here with a note rather than error out.
+        for _b in [b for b in backends if b not in ("fa2", "fa3", "auto")]:
+            print(
+                f"[INFO] Asymmetric K/V is only supported on fa2/fa3; "
+                f"skipping backend '{_b}'."
+            )
+            backends.remove(_b)
+
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
     if "fa2" in backends:
@@ -1213,6 +1258,16 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         v_quantized, _ = to_float8(v_data, kv_dtype)
         kv_cache = torch.cat([k_quantized, v_quantized], dim=1)
 
+    # Asymmetric K/V: FlashInfer's paged wrapper takes a (k_cache, v_cache) tuple
+    # when K and V differ in dtype. Build a contiguous 16-bit K cache and a plain
+    # FP8-cast V cache (calibration-free — matches the kernel's plain fp8 dequant).
+    kv_cache_asym = None
+    if is_asym_kv:
+        kv_cache_asym = (
+            k_cache.to(k_dtype).contiguous(),
+            v_cache.to(v_dtype).contiguous(),
+        )
+
     # Ensure trtllm-fmha-v2 sees contiguous HND-physical paged KV cache.
     # Skip if kv_cache is not a plain Tensor (e.g., NVFP4 packed tuple).
     # backend filter further down also drops trtllm-fmha-v2 in that case.
@@ -1253,6 +1308,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 causal=causal,
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
+                k_data_type=k_dtype,
+                v_data_type=v_dtype,
                 block_tables=block_tables,
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
@@ -1306,7 +1363,9 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         if backend in ["fa2", "fa3", "auto", "trtllm-gen"]:
             return backend_wrappers[backend].run(
                 q,
-                kv_cache,
+                # Asymmetric K/V passes a (k_cache, v_cache) tuple (different dtypes);
+                # symmetric passes the combined kv_cache unchanged.
+                kv_cache_asym if is_asym_kv else kv_cache,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
@@ -1554,6 +1613,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 cur_res["causal"] = causal
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
+                cur_res["k_dtype"] = k_dtype
+                cur_res["v_dtype"] = v_dtype
                 cur_res["avg_actual_seq_len"] = avg_seq_len_q
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
                 cur_res["case_tag"] = args.case_tag
@@ -1627,6 +1688,35 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     is_cuda_graph_compatible = not args.no_cuda_graph
     # return_lse = not args.no_lse # TO-DO: Add support for this
     run_refcheck = args.refcheck
+
+    # Asymmetric K/V: --k_dtype/--v_dtype independently override the K and V cache
+    # dtype (both default to --kv_dtype, so symmetric runs are byte-identical).
+    # Only 16-bit K (bf16/fp16) + FP8 V (e4m3/e5m2), head_dim <= 256, fa2/fa3.
+    k_dtype = dtype_str_to_torch_dtype(args.k_dtype) if args.k_dtype else kv_dtype
+    v_dtype = dtype_str_to_torch_dtype(args.v_dtype) if args.v_dtype else kv_dtype
+    is_asym_kv = k_dtype != v_dtype
+    if is_asym_kv:
+        if k_dtype not in (torch.bfloat16, torch.float16) or v_dtype not in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            print(
+                f"[ERROR] Asymmetric K/V only supports 16-bit K (bf16/fp16) + FP8 V "
+                f"(e4m3/e5m2), got k_dtype={k_dtype}, v_dtype={v_dtype}. Exiting."
+            )
+            return res
+        if head_dim_qk > 256 or (head_dim_vo or head_dim_qk) > 256:
+            print("[ERROR] Asymmetric K/V requires head_dim <= 256. Exiting.")
+            return res
+        rtol, atol = 5e-1, 1e-1  # FP8 V → relax like the symmetric FP8 path
+        # Only fa2/fa3 implement asymmetric K/V; the others fail closed in the
+        # kernel API, so drop them here with a note rather than error out.
+        for _b in [b for b in backends if b not in ("fa2", "fa3", "auto")]:
+            print(
+                f"[INFO] Asymmetric K/V is only supported on fa2/fa3; "
+                f"skipping backend '{_b}'."
+            )
+            backends.remove(_b)
 
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     # Check for backend-specific constraints
@@ -1911,6 +2001,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 causal=causal,
                 q_data_type=q_dtype,
                 kv_data_type=kv_dtype,
+                k_data_type=k_dtype,
+                v_data_type=v_dtype,
             )
         elif backend == "cudnn":
             # cuDNN uses NHD layout and the wrapper API
@@ -1950,6 +2042,11 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         v_scale = v.abs().amax().item() / 256
         k = (k / k_scale).to(kv_dtype)
         v = (v / v_scale).to(kv_dtype)
+    if is_asym_kv:
+        # Calibration-free asymmetric K/V: keep 16-bit K, plain-cast V to FP8
+        # (matches the kernel's plain fp8 dequant on the value path; no scale_v).
+        k = k.to(k_dtype)
+        v = v.to(v_dtype)
 
     # Build the input argument for trtllm-fmha-v2 once, in whichever layout was
     # selected during backend filtering. Done after FP8 quantization so the
