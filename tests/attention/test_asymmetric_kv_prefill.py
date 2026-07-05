@@ -43,6 +43,9 @@ if torch.cuda.is_available():
         _CAP < (8, 9),
         reason="asymmetric K16/V8 (FP8 V) prefill requires sm89+ (FP8 e4m3/e5m2)",
     )
+    _IS_SM90 = _CAP >= (9, 0)
+else:
+    _IS_SM90 = False
 
 K_DTYPES = [torch.float16, torch.bfloat16]
 V_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
@@ -696,6 +699,156 @@ def test_single_prefill_asymmetric_hd512_fails_closed():
     )
     with pytest.raises(NotImplementedError, match=r"head_dim"):
         flashinfer.single_prefill_with_kv_cache(q, k, v)
+
+
+@pytest.mark.skipif(
+    not _IS_SM90, reason="explicit fa3 asymmetric prefill kernel requires sm90 (Hopper)"
+)
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_asymmetric_kv_fa3_explicit(head_dim, v_dtype):
+    """Explicit backend="fa3" asymmetric K/V across single + ragged + paged.
+
+    Pins backend="fa3" so the Hopper dequant-into-smem V producer (the SM90
+    asymmetric path) stays under explicit-backend coverage independent of what
+    backend="auto" resolves to -- the auto-selected tests above hit the same
+    kernel on SM90, but pinning it guards against routing/detection drift and
+    checks that an explicit fa3 request threads DTypeV correctly rather than
+    being rejected by the asymmetric backend guard. Skipped off SM90, where fa3
+    is unavailable. bf16 K, causal, NHD, GQA 32/8 -- one representative point
+    per (head_dim, v_dtype)."""
+    k_dtype = torch.bfloat16
+    causal = True
+    kv_layout = "NHD"
+    num_qo_heads, num_kv_heads, qo_len, kv_len = 32, 8, 32, 129
+    sm_scale = 1.0 / (head_dim**0.5)
+    torch.manual_seed(11)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+
+    def _rel(o, o_ref):
+        return ((o.float() - o_ref).norm() / o_ref.norm().clamp_min(1e-6)).item()
+
+    # --- single prefill (fa3) ---
+    q = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=k_dtype)
+    k = torch.randn(kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=k_dtype) * 0.5
+    v = (
+        torch.randn(kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float32)
+        * 0.5
+    ).to(v_dtype)
+    o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=causal, backend="fa3")
+    rel = _rel(o, _ref_prefill(q, k.float(), v.float(), sm_scale, causal))
+    assert rel < MEDIAN_REL_ERR_BOUND, (
+        f"single fa3 rel err {rel} exceeds {MEDIAN_REL_ERR_BOUND} "
+        f"(v={v_dtype}, hd={head_dim})"
+    )
+
+    # --- ragged prefill (fa3) ---
+    batch_size = 3
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * kv_len
+    )
+    qr = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=k_dtype
+    )
+    kr = (
+        torch.randn(
+            batch_size * kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=k_dtype
+        )
+        * 0.5
+    )
+    vr = (
+        torch.randn(
+            batch_size * kv_len,
+            num_kv_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float32,
+        )
+        * 0.5
+    ).to(v_dtype)
+    ragged = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa3"
+    )
+    ragged.plan(
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        causal=causal,
+        q_data_type=k_dtype,
+        k_data_type=k_dtype,
+        v_data_type=v_dtype,
+    )
+    o_ragged = ragged.run(qr, kr, vr)
+    ragged_rel = []
+    for i in range(batch_size):
+        qi = qr[i * qo_len : (i + 1) * qo_len]
+        ki = kr[i * kv_len : (i + 1) * kv_len].float()
+        vi = vr[i * kv_len : (i + 1) * kv_len].float()
+        oi = o_ragged[i * qo_len : (i + 1) * qo_len]
+        ragged_rel.append(_rel(oi, _ref_prefill(qi, ki, vi, sm_scale, causal)))
+    med = sorted(ragged_rel)[len(ragged_rel) // 2]
+    assert med < MEDIAN_REL_ERR_BOUND, (
+        f"ragged fa3 median rel err {med} exceeds {MEDIAN_REL_ERR_BOUND} "
+        f"(v={v_dtype}, hd={head_dim})"
+    )
+
+    # --- paged prefill (fa3) ---
+    page_size = 16
+    k_cache, num_pages_per_seq, total_num_pages = _build_paged_cache(
+        batch_size, kv_len, page_size, num_kv_heads, head_dim, kv_layout, k_dtype
+    )
+    v_cache, _, _ = _build_paged_cache(
+        batch_size, kv_len, page_size, num_kv_heads, head_dim, kv_layout, v_dtype
+    )
+    paged_kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    paged_kv_indices = torch.arange(
+        0, total_num_pages, device="cuda:0", dtype=torch.int32
+    )
+    paged_kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+    paged = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa3"
+    )
+    paged.plan(
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=paged_kv_indptr,
+        paged_kv_indices=paged_kv_indices,
+        paged_kv_last_page_len=paged_kv_last_page_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=causal,
+        q_data_type=k_dtype,
+        k_data_type=k_dtype,
+        v_data_type=v_dtype,
+    )
+    o_paged = paged.run(qr, (k_cache, v_cache))
+    paged_rel = []
+    for i in range(batch_size):
+        ki = _gather_seq(
+            k_cache.float(), paged_kv_indptr, paged_kv_last_page_len, i, kv_layout
+        )
+        vi = _gather_seq(
+            v_cache.float(), paged_kv_indptr, paged_kv_last_page_len, i, kv_layout
+        )
+        qi = qr[i * qo_len : (i + 1) * qo_len]
+        oi = o_paged[i * qo_len : (i + 1) * qo_len]
+        paged_rel.append(_rel(oi, _ref_prefill(qi, ki, vi, sm_scale, causal)))
+    med = sorted(paged_rel)[len(paged_rel) // 2]
+    assert med < MEDIAN_REL_ERR_BOUND, (
+        f"paged fa3 median rel err {med} exceeds {MEDIAN_REL_ERR_BOUND} "
+        f"(v={v_dtype}, hd={head_dim})"
+    )
 
 
 def test_asym_prefill_backend_guard_helper():
