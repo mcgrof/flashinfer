@@ -187,6 +187,82 @@ def test_batch_decode_asymmetric_kv(
     )
 
 
+@pytest.mark.parametrize("num_qo_heads", [20, 32, 64])
+@pytest.mark.parametrize("kv_len", [517, 2053])
+@pytest.mark.parametrize("batch_size", [3, 7])
+@pytest.mark.parametrize("v_dtype", V_DTYPES)
+def test_batch_decode_asymmetric_kv_high_group(num_qo_heads, kv_len, batch_size, v_dtype):
+    """High GQA group (g > 16) tensor-core decode: exercises the cooperative
+    V-only FP8->BF16 repack (ASYM_COOP_V_DEQUANT). With num_kv_heads=1 the
+    packed query length is num_qo_heads, so FA2DetermineCtaTileQ picks
+    CTA_TILE_Q=64 (the 4Q x 1KV layout) where the legacy per-warp in-register
+    V dequant is serialized; the repack path must be numerically identical to
+    it. The g<=16 cases in test_batch_decode_asymmetric_kv cover CTA_TILE_Q=16
+    (repack gated off), so this is the missing high-g coverage."""
+    torch.manual_seed(42)
+    k_dtype, head_dim, page_size, num_kv_heads, kv_layout = (
+        torch.bfloat16,
+        128,
+        16,
+        1,
+        "NHD",
+    )
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=k_dtype)
+    k_cache, _, num_pages_per_seq, total_num_pages = _build_paged_cache(
+        batch_size, kv_len, page_size, num_kv_heads, head_dim, kv_layout, k_dtype
+    )
+    v_cache, _, _, _ = _build_paged_cache(
+        batch_size, kv_len, page_size, num_kv_heads, head_dim, kv_layout, v_dtype
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+
+    # High g x split-KV needs a larger scratch than the symmetric tests: the
+    # tensor-core prefill-as-decode path stages batch_prefill_tmp_v per split.
+    workspace_buffer = torch.empty(
+        256 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
+    )
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, use_tensor_cores=True
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=k_dtype,
+        k_data_type=k_dtype,
+        v_data_type=v_dtype,
+    )
+    o = wrapper.run(q, (k_cache, v_cache))
+    assert torch.isfinite(o.float()).all()
+
+    sm_scale = 1.0 / (head_dim**0.5)
+    k_stored_fp32 = k_cache.float()
+    v_dequant_fp32 = v_cache.float()
+    rel_errs = []
+    for i in range(batch_size):
+        ki = _gather_seq(k_stored_fp32, kv_indptr, kv_last_page_len, i, kv_layout)
+        vi = _gather_seq(v_dequant_fp32, kv_indptr, kv_last_page_len, i, kv_layout)
+        o_ref = _ref_decode(q[i], ki, vi, sm_scale)
+        rel = (o[i].float() - o_ref).norm() / o_ref.norm().clamp_min(1e-6)
+        rel_errs.append(rel.item())
+    median_rel_err = sorted(rel_errs)[len(rel_errs) // 2]
+    assert median_rel_err < MEDIAN_REL_ERR_BOUND, (
+        f"median rel err {median_rel_err} exceeds {MEDIAN_REL_ERR_BOUND} "
+        f"(g={num_qo_heads}, v={v_dtype})"
+    )
+
+
 def test_asymmetric_one_hot_v_selection_and_lse():
     """Structured oracle: K concentrates attention on one known token per
     sequence and V carries a distinctive fp8-representable constant there,

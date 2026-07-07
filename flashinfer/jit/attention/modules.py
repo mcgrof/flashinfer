@@ -400,6 +400,27 @@ def get_pod_uri(
     )
 
 
+def _asym_coop_v_dequant_val() -> int:
+    """Experiment toggle for the FA2 asym K16/V8 cooperative V-repack.
+
+    Reads FLASHINFER_ASYM_COOP_V_DEQUANT (default "1" = on). Returns 1 (the
+    cooperative V-only FP8->BF16 repack that removes the redundant per-warp
+    dequant exposed at high GQA groups on the FA2 prefill-as-decode path) or 0
+    (legacy in-register dequant baseline, for the A/B measurement). Threaded to
+    include/flashinfer/attention/prefill.cuh as -DASYM_COOP_V_DEQUANT and folded
+    into the JIT URI (below) so 0/1 get distinct cache dirs. There is no existing
+    per-kernel -D env precedent (FLASHINFER_JIT_LINEINFO is the closest, global,
+    read-env->append-flag pattern); documented here per CLAUDE.md.
+    Branch 20260707-asym-decode-coop-vdequant.
+    """
+    return 0 if os.environ.get("FLASHINFER_ASYM_COOP_V_DEQUANT", "1") == "0" else 1
+
+
+def _is_asym_kv(dtype_k: Optional[torch.dtype], dtype_v: Optional[torch.dtype]) -> bool:
+    """True for asymmetric K/V, i.e. distinct K and V dtypes (e.g. K16/V8)."""
+    return dtype_k is not None and dtype_v is not None and dtype_k != dtype_v
+
+
 def get_batch_prefill_uri(
     backend: str,
     dtype_q: torch.dtype,
@@ -426,7 +447,16 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_sm90" if backend == "fa3" else "")
+        # Fold the asym cooperative-V-dequant toggle into the URI (asym fa2 only)
+        # so ASYM_COOP_V_DEQUANT 0/1 get distinct JIT cache dirs and never reuse a
+        # stale .so; non-asym prefill URIs are unchanged.
+        + (
+            f"_asymcoopv{_asym_coop_v_dequant_val()}"
+            if backend == "fa2" and _is_asym_kv(dtype_k, dtype_v)
+            else ""
+        )
     )
 
 
@@ -1737,10 +1767,22 @@ def gen_customize_batch_prefill_module(
 
         generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
+        # _fa2_head_dim_nvcc_flags returns None for head_dim<=256, so coalesce.
+        fa2_cuda_cflags = _fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo) or []
+        if _is_asym_kv(dtype_k, dtype_v):
+            # Experiment (branch 20260707-asym-decode-coop-vdequant): toggle the FA2
+            # asym K16/V8 cooperative V-repack. The macro is inert for non-asym
+            # builds (USE_V_REPACK is false there), so attach it — and the matching
+            # URI suffix above — only for asym modules to avoid churning every other
+            # prefill cache dir. A bare -D reaches prefill.cuh transitively (the
+            # kernel-inst .cu files #include it); no jinja/.inc edit is needed.
+            fa2_cuda_cflags = fa2_cuda_cflags + [
+                f"-DASYM_COOP_V_DEQUANT={_asym_coop_v_dequant_val()}"
+            ]
         return gen_jit_spec(
             uri,
             source_paths,
-            extra_cuda_cflags=_fa2_head_dim_nvcc_flags(head_dim_qk, head_dim_vo),
+            extra_cuda_cflags=fa2_cuda_cflags,
         )
     elif backend == "fa3":
         gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri

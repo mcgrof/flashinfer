@@ -67,6 +67,26 @@ namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
 
+// ASYM_COOP_V_DEQUANT (experiment, branch 20260707-asym-decode-coop-vdequant):
+// toggles the cooperative V-only FP8->BF16 repack for asymmetric K16/V8 decode
+// (BF16 K, FP8 V) on the FA2 group-fused prefill-as-decode path.
+//   1 (default): all threads dequant the whole FP8 V tile into a BF16 staging
+//                buffer ONCE (repack_fp8_tile_to_bf16), then compute_sfm_v reads
+//                native BF16. Removes the redundant per-warp in-register dequant
+//                that is exposed at high GQA groups (CTA_TILE_Q>16 => 4Q x 1KV,
+//                where every Q-warp otherwise re-converts the entire V tile).
+//   0          : legacy in-register per-warp dequant (pre-fix baseline; used for
+//                the A/B measurement that proves the redundant convert is the
+//                high-g cost). See compute_sfm_v's REPACK_BF16 branch.
+// The JIT layer sets this per-module via FLASHINFER_ASYM_COOP_V_DEQUANT
+// (flashinfer/jit/attention/modules.py); this default keeps TUs built without
+// the -D on the fixed path. Gated to CTA_TILE_Q>16 so the low-g (1Q x 4KV)
+// layout, whose in-register dequant is already partitioned across the KV-warps,
+// is left untouched.
+#ifndef ASYM_COOP_V_DEQUANT
+#define ASYM_COOP_V_DEQUANT 1
+#endif
+
 constexpr uint32_t WARP_SIZE = 32;
 // Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
@@ -149,9 +169,18 @@ struct SharedStorageQKVO {
   static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
                                         (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
                                         (CTA_TILE_Q > 16);
+  // FI (asym K16/V8): V-only cooperative repack. Fires when V is FP8 but K is not
+  // (asymmetric), so USE_KV_REPACK above is false. Same gates as USE_KV_REPACK,
+  // incl. CTA_TILE_Q>16 (CTA16 = decode/short-q keeps the cheap in-register
+  // dequant, already partitioned across KV-warps). Off when ASYM_COOP_V_DEQUANT==0.
+  static constexpr bool USE_V_REPACK =
+      (ASYM_COOP_V_DEQUANT != 0) && (sizeof(DTypeV) == 1) && !is_fp4_type_v<DTypeV> &&
+      !std::is_same_v<DTypeK, DTypeV> && (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
+      (CTA_TILE_Q > 16);
   static constexpr uint32_t REPACK_BUF_ELEMS =
       CTA_TILE_KV * (HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO);
-  alignas(16) std::conditional_t<USE_KV_REPACK, DTypeQ[REPACK_BUF_ELEMS], DTypeQ[1]> kv_smem_repack;
+  alignas(16) std::conditional_t<USE_KV_REPACK || USE_V_REPACK, DTypeQ[REPACK_BUF_ELEMS],
+                                 DTypeQ[1]> kv_smem_repack;
   static constexpr bool VO_SPLIT_SMEM = kVOSplit;
   alignas(16) std::conditional_t<VO_SPLIT_SMEM, DTypeQ[CTA_TILE_Q * CTA_TILE_KV], DTypeQ[1]> p_smem;
   alignas(16) std::conditional_t<VO_SPLIT_SMEM, float2[NUM_WARPS_KV * CTA_TILE_Q],
@@ -218,6 +247,12 @@ struct KernelTraits {
   static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV_) == 1) && !is_fp4_type_v<DTypeKV_> &&
                                         (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
                                         (CTA_TILE_Q > 16);  // CTA16 = decode/short-q -> in-loop
+  // FI (asym K16/V8): V-only cooperative repack, mirror of USE_KV_REPACK but keyed
+  // on the V dtype and the K!=V (asymmetric) condition. See ASYM_COOP_V_DEQUANT.
+  static constexpr bool USE_V_REPACK =
+      (ASYM_COOP_V_DEQUANT != 0) && (sizeof(DTypeV_) == 1) && !is_fp4_type_v<DTypeV_> &&
+      !std::is_same_v<DTypeKV_, DTypeV_> && (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
+      (CTA_TILE_Q > 16);
   // b128 columns per KV row in the FP8 (packed) and BF16 (repacked) layouts.
   static constexpr uint32_t REPACK_STRIDE_QK = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t REPACK_STRIDE_VO = HEAD_DIM_VO / upcast_size<DTypeQ_>();
@@ -916,11 +951,15 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
 // FP8 elements and writes two 16-byte chunks of 8 BF16 elements. Afterwards the
 // QK/PV MMAs use the standard 16-bit ldmatrix path (no per-fragment cross-lane
 // swizzle). Numerically identical to the in-loop dequant.
-template <typename KTraits, uint32_t HEAD_DIM>
-__device__ __forceinline__ void repack_fp8_tile_to_bf16(typename KTraits::DTypeKV* smem_fp8,
+template <typename KTraits, uint32_t HEAD_DIM, typename SrcDType = typename KTraits::DTypeKV>
+__device__ __forceinline__ void repack_fp8_tile_to_bf16(SrcDType* smem_fp8,
                                                         typename KTraits::DTypeQ* smem_bf16,
                                                         uint32_t thread_id) {
-  using DTypeKV = typename KTraits::DTypeKV;
+  // FI (asym K16/V8): the repack source dtype is a template parameter, defaulting
+  // to DTypeKV for the symmetric FP8 path (K==V==FP8). The asym V-side caller
+  // passes DTypeV (FP8) so FP8_COLS/upcast_size and the vec_cast below key on the
+  // V element size, not K's (which is BF16 for asym and would mis-stride the tile).
+  using DTypeKV = SrcDType;
   using DTypeQ = typename KTraits::DTypeQ;
   constexpr SwizzleMode SWIZZLE = KTraits::SWIZZLE_MODE_KV;
   constexpr uint32_t NUM_THREADS = KTraits::NUM_THREADS;
@@ -2131,8 +2170,16 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     // path is active, so NUM_MMA_KV is chosen to keep base+staging within the
     // occupancy budget. NOTE: single-prefill doesn't use the repack, but the
     // staging buffer still lives in SharedStorageQKVO, so it must be accounted.
-    constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
-                                (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
+    // kUseRepack also covers the asym K16/V8 V-only cooperative repack (see
+    // ASYM_COOP_V_DEQUANT / USE_V_REPACK): the BF16 staging buffer lives in
+    // SharedStorageQKVO whenever USE_KV_REPACK || USE_V_REPACK, so the occupancy
+    // budget must reserve it in the asym case (K bf16, V fp8) too.
+    constexpr bool kUseRepack =
+        (((sizeof(DTypeKV) == 1) ||
+          ((ASYM_COOP_V_DEQUANT != 0) && (sizeof(DTypeV) == 1) && !std::is_same_v<DTypeK, DTypeV> &&
+           !is_fp4_type_v<DTypeV>)) &&
+         !is_fp4_type_v<DTypeKV>) &&
+        (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
     constexpr bool kKVShared =
         !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
         ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) && (HEAD_DIM_QK == HEAD_DIM_VO) &&
@@ -2473,10 +2520,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       // FP8 repack path: BF16 staging buffers + their (16-bit-strided) read offsets.
       // Guard offsets by USE_KV_REPACK so the stride-8 get_permuted_offset isn't
       // instantiated for the k64B swizzle (HEAD_DIM_VO == 64), which requires stride==4.
+      // asym V-repack (USE_V_REPACK) requires HEAD_DIM_VO != 64 so SWIZZLE_MODE_KV is
+      // k128B (K is BF16 => sizeof 2), so the stride-16 offset below is well-formed.
       smem_t<SWIZZLE_MODE_KV> k_smem_bf16(smem_storage.kv_smem_repack),
           v_smem_bf16(smem_storage.kv_smem_repack);
       uint32_t k_smem_offset_r_bf16 = 0, v_smem_offset_r_bf16 = 0;
-      if constexpr (KTraits::USE_KV_REPACK) {
+      if constexpr (KTraits::USE_KV_REPACK || KTraits::USE_V_REPACK) {
         k_smem_offset_r_bf16 = k_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_QK>(
             get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) + lane_idx % 8,
             (lane_idx % 16) / 8);
@@ -2589,9 +2638,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         block.sync();
 
         // compute sfm*v
-        if constexpr (KTraits::USE_KV_REPACK) {
+        if constexpr (KTraits::USE_KV_REPACK || KTraits::USE_V_REPACK) {
           // Dequantize FP8 V -> BF16 staging smem (shuffle-free), then read native 16-bit.
-          repack_fp8_tile_to_bf16<KTraits, KTraits::HEAD_DIM_VO>(
+          // Source dtype = DTypeV: FP8 for both symmetric (==DTypeKV) and asym K16/V8.
+          repack_fp8_tile_to_bf16<KTraits, KTraits::HEAD_DIM_VO, typename KTraits::DTypeV>(
               smem_storage.v_smem, smem_storage.kv_smem_repack, warp_idx * WARP_SIZE + lane_idx);
           block.sync();
           compute_sfm_v<KTraits, /*REPACK_BF16=*/true>(
@@ -3144,11 +3194,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                    lane_idx % KV_THR_LAYOUT_COL);
 
-      // FP8 repack path
+      // FP8 repack path (symmetric USE_KV_REPACK, or asym V-only USE_V_REPACK).
       smem_t<SWIZZLE_MODE_KV> k_smem_bf16(smem_storage.kv_smem_repack),
           v_smem_bf16(smem_storage.kv_smem_repack);
       uint32_t k_smem_offset_r_bf16 = 0, v_smem_offset_r_bf16 = 0;
-      if constexpr (KTraits::USE_KV_REPACK) {
+      if constexpr (KTraits::USE_KV_REPACK || KTraits::USE_V_REPACK) {
         k_smem_offset_r_bf16 = k_smem_bf16.template get_permuted_offset<KTraits::REPACK_STRIDE_QK>(
             get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) + lane_idx % 8,
             (lane_idx % 16) / 8);
@@ -3396,9 +3446,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
           vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
                                       get_warp_idx_q<KTraits>(tid.y), lane_idx);
-        } else if constexpr (KTraits::USE_KV_REPACK) {
+        } else if constexpr (KTraits::USE_KV_REPACK || KTraits::USE_V_REPACK) {
           // Dequantize FP8 V -> BF16 staging smem (shuffle-free), then read native 16-bit.
-          repack_fp8_tile_to_bf16<KTraits, KTraits::HEAD_DIM_VO>(
+          // Source dtype = DTypeV: FP8 for both symmetric (==DTypeKV) and asym K16/V8.
+          repack_fp8_tile_to_bf16<KTraits, KTraits::HEAD_DIM_VO, typename KTraits::DTypeV>(
               smem_storage.v_smem, smem_storage.kv_smem_repack, warp_idx * WARP_SIZE + lane_idx);
           block.sync();
           compute_sfm_v<KTraits, /*REPACK_BF16=*/true>(
@@ -3567,8 +3618,16 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   // staging buffer (sized max(HEAD_DIM_QK, HEAD_DIM_VO)) when the FP8 repack path
   // is active, so NUM_MMA_KV is chosen to keep base+staging within the occupancy
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
-  constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
-                              (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
+  // kUseRepack also covers the asym K16/V8 V-only cooperative repack (see
+  // ASYM_COOP_V_DEQUANT / USE_V_REPACK): the BF16 staging buffer lives in
+  // SharedStorageQKVO whenever USE_KV_REPACK || USE_V_REPACK, so the occupancy
+  // budget must reserve it in the asym case (K bf16, V fp8) too.
+  constexpr bool kUseRepack =
+      (((sizeof(DTypeKV) == 1) ||
+        ((ASYM_COOP_V_DEQUANT != 0) && (sizeof(DTypeV) == 1) && !std::is_same_v<DTypeK, DTypeV> &&
+         !is_fp4_type_v<DTypeV>)) &&
+       !is_fp4_type_v<DTypeKV>) &&
+      (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
   // Matches KernelTraits::USE_KV_SHARED_SMEM: at large head dims K and V
   // time-share one smem buffer, so the occupancy budget counts the K/V
   // footprint once exactly when the kernel actually shares it.
@@ -3759,8 +3818,16 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // staging buffer (sized max(HEAD_DIM_QK, HEAD_DIM_VO)) when the FP8 repack path
   // is active, so NUM_MMA_KV is chosen to keep base+staging within the occupancy
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
-  constexpr bool kUseRepack = (sizeof(DTypeKV) == 1) && !is_fp4_type_v<DTypeKV> &&
-                              (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
+  // kUseRepack also covers the asym K16/V8 V-only cooperative repack (see
+  // ASYM_COOP_V_DEQUANT / USE_V_REPACK): the BF16 staging buffer lives in
+  // SharedStorageQKVO whenever USE_KV_REPACK || USE_V_REPACK, so the occupancy
+  // budget must reserve it in the asym case (K bf16, V fp8) too.
+  constexpr bool kUseRepack =
+      (((sizeof(DTypeKV) == 1) ||
+        ((ASYM_COOP_V_DEQUANT != 0) && (sizeof(DTypeV) == 1) && !std::is_same_v<DTypeK, DTypeV> &&
+         !is_fp4_type_v<DTypeV>)) &&
+       !is_fp4_type_v<DTypeKV>) &&
+      (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) && (CTA_TILE_Q > 16);
   // Matches KernelTraits::USE_KV_SHARED_SMEM: K/V share one smem buffer for bf16/fp16 at every
   // tile and for FP8 only at CTA_TILE_Q=32 (not NVFP4), so the occupancy budget counts the K/V
   // footprint once exactly when the kernel actually shares it.
