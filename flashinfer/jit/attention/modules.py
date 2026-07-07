@@ -416,6 +416,23 @@ def _asym_coop_v_dequant_val() -> int:
     return 0 if os.environ.get("FLASHINFER_ASYM_COOP_V_DEQUANT", "1") == "0" else 1
 
 
+def _asym_fp8_pv_val() -> int:
+    """Experiment toggle for the FA2 asym K16/V8 native FP8 PV MMA ("fix C").
+
+    Reads FLASHINFER_ASYM_FP8_PV (default "0" = off). Returns 1 (native
+    FP8xFP8 PV MMA, m16n8k32, at CTA_TILE_Q==128 only -- the tree-speculative
+    packed_qo>64 regime) or 0 (fall back to fix A cooperative repack at 128).
+    Default OFF: validated on H100/SM90 as a net regression (operand-production
+    overhead swamps the FP8-MMA gain since decode attention is memory-bound;
+    1.1-2.0x slower than fix A in the memory-bound regime, ~ties only in the
+    compute-bound short-kv/bs1 corner). Kept behind the toggle as a reproducible
+    negative result. Threaded to prefill.cuh as -DASYM_FP8_PV and folded into
+    the JIT URI so 0/1 get distinct cache dirs.
+    Branch 20260707-asym-decode-coop-vdequant.
+    """
+    return 1 if os.environ.get("FLASHINFER_ASYM_FP8_PV", "0") == "1" else 0
+
+
 def _is_asym_kv(dtype_k: Optional[torch.dtype], dtype_v: Optional[torch.dtype]) -> bool:
     """True for asymmetric K/V, i.e. distinct K and V dtypes (e.g. K16/V8)."""
     return dtype_k is not None and dtype_v is not None and dtype_k != dtype_v
@@ -454,6 +471,13 @@ def get_batch_prefill_uri(
         # stale .so; non-asym prefill URIs are unchanged.
         + (
             f"_asymcoopv{_asym_coop_v_dequant_val()}"
+            if backend == "fa2" and _is_asym_kv(dtype_k, dtype_v)
+            else ""
+        )
+        # Fold the native FP8-PV toggle ("fix C") into the URI (asym fa2 only) so
+        # ASYM_FP8_PV 0/1 get distinct JIT cache dirs.
+        + (
+            f"_asymfp8pv{_asym_fp8_pv_val()}"
             if backend == "fa2" and _is_asym_kv(dtype_k, dtype_v)
             else ""
         )
@@ -1777,7 +1801,8 @@ def gen_customize_batch_prefill_module(
             # prefill cache dir. A bare -D reaches prefill.cuh transitively (the
             # kernel-inst .cu files #include it); no jinja/.inc edit is needed.
             fa2_cuda_cflags = fa2_cuda_cflags + [
-                f"-DASYM_COOP_V_DEQUANT={_asym_coop_v_dequant_val()}"
+                f"-DASYM_COOP_V_DEQUANT={_asym_coop_v_dequant_val()}",
+                f"-DASYM_FP8_PV={_asym_fp8_pv_val()}",
             ]
         return gen_jit_spec(
             uri,

@@ -87,6 +87,29 @@ using mma::MMAMode;
 #define ASYM_COOP_V_DEQUANT 1
 #endif
 
+// ASYM_FP8_PV ("fix C", branch 20260707-asym-decode-coop-vdequant): native
+// FP8xFP8 PV MMA (mma.sync.m16n8k32.f32.e4m3.e4m3, k=32) for asymmetric K16/V8
+// decode, replacing the BF16 PV MMA (k=16) that dequantizes FP8 V to BF16 first.
+// Quantizes the post-softmax weights P to FP8 (constant scale 448, unscaled back
+// at write-out) and multiplies against native FP8 V -> 2x PV throughput, no V
+// dequant. Gated STRICTLY to CTA_TILE_Q==128 (packed_qo>64 = the tree-speculative
+// regime): everywhere else fix A (cooperative repack) already reaches parity, so
+// the fragile P->FP8 smem round-trip is confined to the one tile where the PV MMA
+// can be compute-bound. Both operands are staged to LINEAR smem (swizzle-decoupled)
+// and loaded via the sparse_mla_sm120 FP8 loaders (SM90-portable).
+//   1          : native FP8 PV at CTA_TILE_Q==128 (asym only).
+//   0 (default): disabled; CTA_TILE_Q==128 falls back to fix A (USE_V_REPACK).
+// Default is OFF: on SM90 the native-FP8-MMA throughput gain is swamped by
+// operand-production overhead (V linear staging + P smem round-trip + d2 PRMT
+// transpose), so decode attention -- memory/overhead-bound, not PV-MMA-bound --
+// runs 1.1-2.0x SLOWER than fix A in the memory-bound regime and only ~ties in
+// the tiny compute-bound (short-kv/bs1) corner. Kept behind the macro as a
+// validated negative result (matches the opportunity-table/cmcp verdict).
+// Set per-module via FLASHINFER_ASYM_FP8_PV (flashinfer/jit/attention/modules.py).
+#ifndef ASYM_FP8_PV
+#define ASYM_FP8_PV 0
+#endif
+
 constexpr uint32_t WARP_SIZE = 32;
 // Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
@@ -173,14 +196,25 @@ struct SharedStorageQKVO {
   // (asymmetric), so USE_KV_REPACK above is false. Same gates as USE_KV_REPACK,
   // incl. CTA_TILE_Q>16 (CTA16 = decode/short-q keeps the cheap in-register
   // dequant, already partitioned across KV-warps). Off when ASYM_COOP_V_DEQUANT==0.
+  // FI ("fix C"): native FP8 PV at CTA_TILE_Q==128 (see ASYM_FP8_PV). Mutually
+  // exclusive with USE_V_REPACK per tile.
+  static constexpr bool USE_FP8_PV =
+      (ASYM_FP8_PV != 0) && (sizeof(DTypeV) == 1) && !is_fp4_type_v<DTypeV> &&
+      !std::is_same_v<DTypeK, DTypeV> && (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
+      (CTA_TILE_Q == 128);
   static constexpr bool USE_V_REPACK =
       (ASYM_COOP_V_DEQUANT != 0) && (sizeof(DTypeV) == 1) && !is_fp4_type_v<DTypeV> &&
       !std::is_same_v<DTypeK, DTypeV> && (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
-      (CTA_TILE_Q > 16);
+      (CTA_TILE_Q > 16) && !USE_FP8_PV;
   static constexpr uint32_t REPACK_BUF_ELEMS =
       CTA_TILE_KV * (HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO);
-  alignas(16) std::conditional_t<USE_KV_REPACK || USE_V_REPACK, DTypeQ[REPACK_BUF_ELEMS],
-                                 DTypeQ[1]> kv_smem_repack;
+  // kv_smem_repack is reused as the linear FP8 V staging buffer on the FP8-PV path.
+  alignas(16) std::conditional_t<USE_KV_REPACK || USE_V_REPACK || USE_FP8_PV,
+                                 DTypeQ[REPACK_BUF_ELEMS], DTypeQ[1]> kv_smem_repack;
+  // FP8-PV P-weight staging: [CTA_TILE_Q rows][32 fp8 kv/slab] (P_STRIDE=32 bytes).
+  static constexpr uint32_t FP8PV_P_STRIDE = 32;
+  alignas(16) std::conditional_t<USE_FP8_PV, uint8_t[CTA_TILE_Q * FP8PV_P_STRIDE],
+                                 uint8_t[1]> p_smem_fp8;
   static constexpr bool VO_SPLIT_SMEM = kVOSplit;
   alignas(16) std::conditional_t<VO_SPLIT_SMEM, DTypeQ[CTA_TILE_Q * CTA_TILE_KV], DTypeQ[1]> p_smem;
   alignas(16) std::conditional_t<VO_SPLIT_SMEM, float2[NUM_WARPS_KV * CTA_TILE_Q],
@@ -247,12 +281,20 @@ struct KernelTraits {
   static constexpr bool USE_KV_REPACK = (sizeof(DTypeKV_) == 1) && !is_fp4_type_v<DTypeKV_> &&
                                         (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
                                         (CTA_TILE_Q > 16);  // CTA16 = decode/short-q -> in-loop
+  // FI ("fix C", asym K16/V8): native FP8 PV MMA at CTA_TILE_Q==128 only (the
+  // tree-speculative packed_qo>64 regime). See ASYM_FP8_PV.
+  static constexpr bool USE_FP8_PV =
+      (ASYM_FP8_PV != 0) && (sizeof(DTypeV_) == 1) && !is_fp4_type_v<DTypeV_> &&
+      !std::is_same_v<DTypeKV_, DTypeV_> && (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
+      (CTA_TILE_Q == 128);
   // FI (asym K16/V8): V-only cooperative repack, mirror of USE_KV_REPACK but keyed
   // on the V dtype and the K!=V (asymmetric) condition. See ASYM_COOP_V_DEQUANT.
+  // Excludes CTA_TILE_Q==128 when USE_FP8_PV is active (that tile takes the native
+  // FP8 PV path instead of the BF16 repack).
   static constexpr bool USE_V_REPACK =
       (ASYM_COOP_V_DEQUANT != 0) && (sizeof(DTypeV_) == 1) && !is_fp4_type_v<DTypeV_> &&
       !std::is_same_v<DTypeKV_, DTypeV_> && (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
-      (CTA_TILE_Q > 16);
+      (CTA_TILE_Q > 16) && !USE_FP8_PV;
   // b128 columns per KV row in the FP8 (packed) and BF16 (repacked) layouts.
   static constexpr uint32_t REPACK_STRIDE_QK = HEAD_DIM_QK / upcast_size<DTypeQ_>();
   static constexpr uint32_t REPACK_STRIDE_VO = HEAD_DIM_VO / upcast_size<DTypeQ_>();
@@ -981,6 +1023,205 @@ __device__ __forceinline__ void repack_fp8_tile_to_bf16(SrcDType* smem_fp8,
     vec_cast<DTypeQ, DTypeKV>::template cast<16>(conv, (DTypeKV*)&packed);
     dst[get_permuted_offset<SWIZZLE, BF16_COLS>(row, 2 * col)] = *(b128_t*)&conv[0];
     dst[get_permuted_offset<SWIZZLE, BF16_COLS>(row, 2 * col + 1)] = *(b128_t*)&conv[8];
+  }
+}
+
+// ===========================================================================
+// ASYM_FP8_PV ("fix C"): native FP8 PV MMA (m16n8k32) helpers.  Ported from
+// sparse_mla_sm120 (SM90-portable: plain ldmatrix / LDS.32 / prmt).  Both MMA
+// operands are produced from LINEAR smem staging (swizzle-decoupled).
+// ===========================================================================
+
+// ldmatrix.x4 of four 8x8 b16 sub-tiles (FP8 A operand = 16x32 fp8 = 16x16 b16).
+__device__ __forceinline__ void fp8pv_ldmatrix_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2,
+                                                  uint32_t& r3, const void* smem_ptr) {
+  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+               : "r"(addr));
+}
+
+// FP8 A operand [16 rows x 32 k]: map 32 lanes to the 4 8x8 b16 sub-matrices.
+// smem_base points at this mma tile's row 0; stride is bytes per row.
+__device__ __forceinline__ void fp8pv_load_A(uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3,
+                                             const uint8_t* smem_base, int stride, int lane) {
+  int row = (lane & 7) + ((lane >> 3) & 1) * 8;
+  int col = (lane >> 4) * 16;  // bytes (16 fp8 = 8 b16)
+  fp8pv_ldmatrix_x4(a0, a1, a2, a3, smem_base + row * stride + col);
+}
+
+// D2 direct B operand for FP8 XV MMA (m16n8k32) from linear kv_smem[entry][dim].
+// b0 byte j = V[entry_base + tid*4+j][dim+gid] (k=0..15); b1 = entry_base+16 (k=16..31).
+template <int KV_STRIDE>
+__device__ __forceinline__ void fp8pv_load_B(uint32_t& b0, uint32_t& b1,
+                                             const uint8_t* __restrict__ kv_smem, int entry_base,
+                                             int dim, int lane) {
+  const int gid = lane >> 2;
+  const int tid = lane & 3;
+  const int d = dim + gid;
+  const int d_base = d & ~3;
+  const int d_sel = d & 3;
+  const uint32_t sel = ((4 + d_sel) << 4) | d_sel;
+  {
+    uint32_t r0 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + tid * 4 + 0) * KV_STRIDE + d_base);
+    uint32_t r1 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + tid * 4 + 1) * KV_STRIDE + d_base);
+    uint32_t r2 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + tid * 4 + 2) * KV_STRIDE + d_base);
+    uint32_t r3 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + tid * 4 + 3) * KV_STRIDE + d_base);
+    uint32_t t01, t23;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(t01) : "r"(r0), "r"(r1), "r"(sel));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(t23) : "r"(r2), "r"(r3), "r"(sel));
+    asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(b0) : "r"(t01), "r"(t23));
+  }
+  {
+    uint32_t r0 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + 16 + tid * 4 + 0) * KV_STRIDE + d_base);
+    uint32_t r1 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + 16 + tid * 4 + 1) * KV_STRIDE + d_base);
+    uint32_t r2 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + 16 + tid * 4 + 2) * KV_STRIDE + d_base);
+    uint32_t r3 = *reinterpret_cast<const uint32_t*>(kv_smem + (entry_base + 16 + tid * 4 + 3) * KV_STRIDE + d_base);
+    uint32_t t01, t23;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(t01) : "r"(r0), "r"(r1), "r"(sel));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n" : "=r"(t23) : "r"(r2), "r"(r3), "r"(sel));
+    asm volatile("prmt.b32 %0, %1, %2, 0x5410;\n" : "=r"(b1) : "r"(t01), "r"(t23));
+  }
+}
+
+// Stage the swizzled FP8 V tile into a LINEAR [kv][head_dim] FP8 buffer (KV_STRIDE
+// = HEAD_DIM_VO bytes/row).  Mirror of repack_fp8_tile_to_bf16 but keeps FP8 and
+// writes linear (no swizzle).  Phantom rows [CTA_TILE_KV, NUM_ROWS_PADDED) are
+// zero-filled so an odd NUM_MMA_KV (32-kv slab tail) reads 0, not NaN.
+template <typename KTraits>
+__device__ __forceinline__ void stage_v_fp8_linear(typename KTraits::DTypeV* v_smem_swz,
+                                                   uint8_t* v_lin, uint32_t thread_id) {
+  using DTypeV = typename KTraits::DTypeV;
+  constexpr SwizzleMode SWIZZLE = KTraits::SWIZZLE_MODE_KV;
+  constexpr uint32_t NUM_THREADS = KTraits::NUM_THREADS;
+  constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
+  constexpr uint32_t HEAD_DIM_VO = KTraits::HEAD_DIM_VO;
+  constexpr uint32_t FP8_COLS = HEAD_DIM_VO / upcast_size<DTypeV>();  // b128 cols / row
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  constexpr uint32_t NUM_ROWS_PADDED = ((NUM_MMA_KV + 1) / 2) * 32;  // round up to 32-kv slab
+  constexpr uint32_t NUM_B128 = NUM_ROWS_PADDED * FP8_COLS;
+  b128_t* src = (b128_t*)v_smem_swz;
+#pragma unroll
+  for (uint32_t idx = thread_id; idx < NUM_B128; idx += NUM_THREADS) {
+    uint32_t row = idx / FP8_COLS, col = idx % FP8_COLS;
+    b128_t packed;
+    if (row < CTA_TILE_KV) {
+      packed = src[get_permuted_offset<SWIZZLE, FP8_COLS>(row, col)];
+    } else {
+      packed.x = 0; packed.y = 0; packed.z = 0; packed.w = 0;  // phantom -> 0
+    }
+    *(b128_t*)(v_lin + row * HEAD_DIM_VO + col * 16) = packed;
+  }
+}
+
+// Native FP8 PV: O += P_fp8 @ V_fp8 (m16n8k32, k=32).  P quantized with a constant
+// scale p_scale=448 (P in (0,1]); o_frag accumulates p_scale x true and is unscaled
+// once at write-out.  v_lin: linear [kv][hd] FP8; p_smem_fp8: [CTA_TILE_Q][P_STRIDE]
+// FP8 (global-q-row indexed); warp_q_base: this warp's first global q-row.
+template <typename KTraits>
+__device__ __forceinline__ void compute_sfm_v_fp8pv(
+    uint8_t* v_lin, uint8_t* p_smem_fp8, uint32_t lane_idx, uint32_t warp_q_base,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], float (*d)[2]) {
+  using DTypeQKAccum = typename KTraits::DTypeQKAccum;
+  constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  constexpr uint32_t NUM_MMA_D_VO = KTraits::NUM_MMA_D_VO;
+  constexpr uint32_t P_STRIDE = 32;                        // 32 fp8 kv / slab row, bytes
+  constexpr int KV_STRIDE = (int)KTraits::HEAD_DIM_VO;     // bytes / kv row in v_lin
+  constexpr uint32_t NUM_SLABS = (NUM_MMA_KV + 1) / 2;
+  const float p_scale = 448.f;
+
+  // rowsum d (softmax denominator) -- identical to compute_sfm_v.
+  typename KTraits::DTypeQ s_frag_f16[NUM_MMA_Q][NUM_MMA_KV][8];
+  if constexpr (std::is_same_v<DTypeQKAccum, float>) {
+#pragma unroll
+    for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq)
+#pragma unroll
+      for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv)
+        vec_cast<typename KTraits::DTypeQ, float>::template cast<8>(s_frag_f16[mq][mkv],
+                                                                    s_frag[mq][mkv]);
+  }
+  if constexpr (KTraits::AttentionVariant::use_softmax) {
+#pragma unroll
+    for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq)
+#pragma unroll
+      for (uint32_t mkv = 0; mkv < NUM_MMA_KV; ++mkv) {
+        if constexpr (std::is_same_v<DTypeQKAccum, float>) {
+          mma::m16k16_rowsum_f16f16f32(d[mq], s_frag_f16[mq][mkv]);
+        } else {
+          mma::m16k16_rowsum_f16f16f32(d[mq], s_frag[mq][mkv]);
+        }
+      }
+  }
+
+  const uint32_t kvc = 2 * (lane_idx % 4);
+#pragma unroll
+  for (uint32_t slab = 0; slab < NUM_SLABS; ++slab) {
+    const uint32_t kt_a = 2 * slab, kt_b = 2 * slab + 1;
+#pragma unroll
+    for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+      const uint32_t qr0 = warp_q_base + mq * 16 + lane_idx / 4;
+      const uint32_t qr1 = qr0 + 8;
+      auto scatter = [&](uint32_t kt, uint32_t kb) {
+        float f[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) f[e] = float(s_frag[mq][kt][e]) * p_scale;
+        p_smem_fp8[qr0 * P_STRIDE + kb + kvc + 0] = (uint8_t)__nv_fp8_e4m3(f[0]).__x;
+        p_smem_fp8[qr0 * P_STRIDE + kb + kvc + 1] = (uint8_t)__nv_fp8_e4m3(f[1]).__x;
+        p_smem_fp8[qr1 * P_STRIDE + kb + kvc + 0] = (uint8_t)__nv_fp8_e4m3(f[2]).__x;
+        p_smem_fp8[qr1 * P_STRIDE + kb + kvc + 1] = (uint8_t)__nv_fp8_e4m3(f[3]).__x;
+        p_smem_fp8[qr0 * P_STRIDE + kb + kvc + 8] = (uint8_t)__nv_fp8_e4m3(f[4]).__x;
+        p_smem_fp8[qr0 * P_STRIDE + kb + kvc + 9] = (uint8_t)__nv_fp8_e4m3(f[5]).__x;
+        p_smem_fp8[qr1 * P_STRIDE + kb + kvc + 8] = (uint8_t)__nv_fp8_e4m3(f[6]).__x;
+        p_smem_fp8[qr1 * P_STRIDE + kb + kvc + 9] = (uint8_t)__nv_fp8_e4m3(f[7]).__x;
+      };
+      scatter(kt_a, 0);
+      if (kt_b < NUM_MMA_KV) {
+        scatter(kt_b, 16);
+      } else {
+        p_smem_fp8[qr0 * P_STRIDE + 16 + kvc + 0] = 0;
+        p_smem_fp8[qr0 * P_STRIDE + 16 + kvc + 1] = 0;
+        p_smem_fp8[qr1 * P_STRIDE + 16 + kvc + 0] = 0;
+        p_smem_fp8[qr1 * P_STRIDE + 16 + kvc + 1] = 0;
+        p_smem_fp8[qr0 * P_STRIDE + 16 + kvc + 8] = 0;
+        p_smem_fp8[qr0 * P_STRIDE + 16 + kvc + 9] = 0;
+        p_smem_fp8[qr1 * P_STRIDE + 16 + kvc + 8] = 0;
+        p_smem_fp8[qr1 * P_STRIDE + 16 + kvc + 9] = 0;
+      }
+    }
+    __syncwarp();
+#pragma unroll
+    for (uint32_t mq = 0; mq < NUM_MMA_Q; ++mq) {
+      uint32_t A[4];
+      fp8pv_load_A(A[0], A[1], A[2], A[3],
+                   p_smem_fp8 + (warp_q_base + mq * 16) * P_STRIDE, P_STRIDE, lane_idx);
+#pragma unroll
+      for (uint32_t md = 0; md < NUM_MMA_D_VO; ++md) {
+        uint32_t B[4];
+        fp8pv_load_B<KV_STRIDE>(B[0], B[1], v_lin, slab * 32, md * 16, lane_idx);
+        fp8pv_load_B<KV_STRIDE>(B[2], B[3], v_lin, slab * 32, md * 16 + 8, lane_idx);
+        mma::mma_sync_m16n16k32_row_col_f8f8f32<__nv_fp8_e4m3>(o_frag[mq][md], A, B);
+      }
+    }
+    __syncwarp();
+  }
+}
+
+// Unscale the constant FP8-PV P-quant scale (o_frag accumulated p_scale x true).
+// Deduces the head-dim tile count D so it type-checks under both the ragged
+// (NUM_MMA_D_VO_TILE) and paged (O_FRAG_D) o_frag declarations. No-op unless
+// USE_FP8_PV. Call ONLY after a compute_sfm_v_fp8pv-driven accumulation.
+template <typename KTraits, uint32_t D>
+__device__ __forceinline__ void fp8pv_unscale_o(float (*o_frag)[D][8]) {
+  if constexpr (KTraits::USE_FP8_PV) {
+    constexpr float inv_p_scale = 1.f / 448.f;
+#pragma unroll
+    for (uint32_t mq = 0; mq < KTraits::NUM_MMA_Q; ++mq)
+#pragma unroll
+      for (uint32_t md = 0; md < D; ++md)
+#pragma unroll
+        for (uint32_t r = 0; r < 8; ++r) o_frag[mq][md][r] *= inv_p_scale;
   }
 }
 
@@ -2638,7 +2879,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
         block.sync();
 
         // compute sfm*v
-        if constexpr (KTraits::USE_KV_REPACK || KTraits::USE_V_REPACK) {
+        if constexpr (KTraits::USE_FP8_PV) {
+          // Native FP8 PV ("fix C"): stage V to linear FP8, then P_fp8 @ V_fp8 (m16n8k32).
+          stage_v_fp8_linear<KTraits>(smem_storage.v_smem, (uint8_t*)smem_storage.kv_smem_repack,
+                                      warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+          compute_sfm_v_fp8pv<KTraits>(
+              (uint8_t*)smem_storage.kv_smem_repack, smem_storage.p_smem_fp8, lane_idx,
+              get_warp_idx_q<KTraits>(tid.y) * KTraits::NUM_MMA_Q * 16, s_frag, o_frag, d);
+        } else if constexpr (KTraits::USE_KV_REPACK || KTraits::USE_V_REPACK) {
           // Dequantize FP8 V -> BF16 staging smem (shuffle-free), then read native 16-bit.
           // Source dtype = DTypeV: FP8 for both symmetric (==DTypeKV) and asym K16/V8.
           repack_fp8_tile_to_bf16<KTraits, KTraits::HEAD_DIM_VO, typename KTraits::DTypeV>(
@@ -2678,6 +2927,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       block.sync();
 
       finalize_m<KTraits>(variant, m);
+
+      // FI ("fix C"): unscale the constant FP8-PV P-quant scale before normalize.
+      fp8pv_unscale_o<KTraits>(o_frag);
 
       // threadblock synchronization
       threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
@@ -3446,6 +3698,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               get_warp_idx_kv<KTraits>(tid.z) * KTraits::NUM_MMA_D_VO_PER_WARP;
           vosplit_compute_pv<KTraits>(&smem_storage, o_frag, o_scale, warp_vo_base,
                                       get_warp_idx_q<KTraits>(tid.y), lane_idx);
+        } else if constexpr (KTraits::USE_FP8_PV) {
+          // Native FP8 PV ("fix C"): stage V to linear FP8, then P_fp8 @ V_fp8 (m16n8k32).
+          stage_v_fp8_linear<KTraits>(smem_storage.v_smem, (uint8_t*)smem_storage.kv_smem_repack,
+                                      warp_idx * WARP_SIZE + lane_idx);
+          block.sync();
+          compute_sfm_v_fp8pv<KTraits>(
+              (uint8_t*)smem_storage.kv_smem_repack, smem_storage.p_smem_fp8, lane_idx,
+              get_warp_idx_q<KTraits>(tid.y) * KTraits::NUM_MMA_Q * 16, s_frag, o_frag, d);
         } else if constexpr (KTraits::USE_KV_REPACK || KTraits::USE_V_REPACK) {
           // Dequantize FP8 V -> BF16 staging smem (shuffle-free), then read native 16-bit.
           // Source dtype = DTypeV: FP8 for both symmetric (==DTypeKV) and asym K16/V8.
@@ -3491,6 +3751,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       block.sync();
 
       finalize_m<KTraits>(variant, m);
+
+      // FI ("fix C"): unscale the constant FP8-PV P-quant scale before normalize.
+      fp8pv_unscale_o<KTraits>(o_frag);
 
       const uint32_t num_kv_chunks =
           ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
