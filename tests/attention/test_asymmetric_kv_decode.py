@@ -433,13 +433,15 @@ def test_asymmetric_run_v_dtype_mismatch_raises():
         wrapper.run(q, (k_cache, v_cache_wrong))
 
 
-def test_asymmetric_tensor_cores_raises():
+def test_asymmetric_tensor_cores_plans():
+    # PR-4 lifted the asym + use_tensor_cores guard: asymmetric K/V decode now
+    # routes through the SM90 tensor-core prefill-as-decode kernel (faster than the
+    # CUDA-core path). Planning must SUCCEED where the guard previously raised.
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, "NHD", use_tensor_cores=True
     )
-    with pytest.raises(NotImplementedError, match=r"[Aa]symmetric"):
-        _plan_asym(wrapper)
+    _plan_asym(wrapper)  # must not raise now that the guard is lifted
 
 
 def test_single_decode_asymmetric_raises():
