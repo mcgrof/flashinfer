@@ -1366,6 +1366,10 @@ def single_prefill_with_kv_cache(
             k.dtype,
             head_dim_qk=q.shape[-1],
             head_dim_vo=out_head_dim,
+            # Single prefill: q is [qo_len, num_heads, head_dim], so the query
+            # length is q.shape[0]. Lets a decode-like short-qo/long-kv call route
+            # to FA2 on SM90 (see determine_attention_backend).
+            max_qo_len=q.shape[0],
         )
 
     # Unpack NVFP4 scale factors
@@ -2283,6 +2287,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     kv_data_type,
                     head_dim_qk=head_dim_qk,
                     head_dim_vo=head_dim_vo,
+                    # Route decode-like short-query verify shapes to FA2 on SM90
+                    # (see determine_attention_backend). self._max_q_len was
+                    # computed above from qo_indptr_host -- no extra device sync.
+                    max_qo_len=self._max_q_len,
                 )
             if self._backend != "cudnn":
                 get_module_args = (
@@ -3387,6 +3395,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
+                # Route decode-like short-query verify shapes to FA2 on SM90 (see
+                # determine_attention_backend). qo_indptr_host is already on the
+                # host here, so deriving max_qo_len costs no extra device sync.
+                _max_qo_len = int(max(qo_indptr_host[1:] - qo_indptr_host[:-1]))
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -3396,6 +3408,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     kv_data_type,
                     head_dim_qk=head_dim_qk,
                     head_dim_vo=head_dim_vo,
+                    max_qo_len=_max_qo_len,
                 )
 
             get_module_args = (
