@@ -473,6 +473,40 @@ def is_cutlass_backend_supported(
     return True
 
 
+# SM90 decode-like short-query routing threshold.
+#
+# On SM90 (Hopper) the batch-prefill "auto" backend chooses between FA2 (the
+# hand-written kernel, which fuses the GQA query-head group and has a split-KV /
+# flash-decoding reduction) and FA3 (the WGMMA/TMA warp-specialized kernel, built
+# for large-query prefill). For a DECODE-LIKE shape -- a small per-request query
+# length against a long KV cache, e.g. speculative-decode verify/append or chunked
+# decode -- FA3 is pathologically slow. Its tile scheduler assigns work per
+# query-head with NO K/V reuse across the GQA group, and it has no split-KV, so it
+# (a) rereads the KV cache ~group_size times from HBM at high batch and (b) starves
+# the GPU at low batch. FA2 fuses the GQA group (reads KV once) and splits the KV
+# reduction, hitting the memory roofline, and is bit-compatible with FA3 here.
+#
+# This is NOT "disable the better backend": FA3 stays the default for real prefill.
+# It corrects a shape misclassification -- "auto" was sending a decode-like shape to
+# a prefill-tuned kernel. Measured on H100 SXM5 (bf16, num_qo_heads=28 /
+# num_kv_heads=4 (GQA=7), head_dim=128, qo_len=4), Nsight Compute dram__bytes_read:
+#     b=64 kv=32k:  FA2 4.298 GB (1.0x the KV cache, 90% of the DRAM roofline)
+#                   FA3 21.41 GB (4.98x the KV cache -- the GQA reread)
+#                   -> FA3 8.36 ms vs FA2 1.42 ms (5.9x); FA2 is at the roofline,
+#                      so a "fixed" FA3 could only match it, not beat it.
+#     b=1  kv=32k:  FA2 43 us (57% DRAM) vs FA3 546 us (3.8% DRAM, starved) -> 12.7x
+# rel-err(FA2, FA3) = 3.9e-3 (bf16), i.e. FA2 is a numeric drop-in.
+# qo_len sweep (bf16, kv=8191, b=16): FA2 wins for qo_len <= 64 (up to 4.4x), FA3
+# wins for qo_len >= 128 (~1.5x); the two are equal near qo_len ~= 78.
+#
+# 64 is the conservative threshold: it sits *below* the measured crossover (~78), so
+# real long-query prefill (qo_len >= 128) is NEVER rerouted -- there is no prefill
+# regression -- while covering chain speculative decode (qo_len 2-8) and typical
+# tree verify (qo_len <= 64). Only float16/bfloat16 KV is rerouted; fp8 / packed-fp4
+# KV keep their existing FA3 selection (no measured evidence there yet).
+SM90_DECODE_LIKE_QO_THRESHOLD = 64
+
+
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
@@ -480,6 +514,7 @@ def determine_attention_backend(
     use_custom_mask: bool,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
+    max_qo_len: Optional[int] = None,
 ) -> str:
     """
     Determine the appropriate attention backend based on the device and parameters.
@@ -500,6 +535,12 @@ def determine_attention_backend(
         The data type of the query tensor.
     dtype_kv : torch.dtype
         The data type of the key-value tensor.
+    max_qo_len : Optional[int]
+        The maximum per-request query length for this plan (``max(qo_indptr diff)``),
+        when the caller knows it. Used only on SM90 to route decode-like short-query
+        shapes to FA2 instead of the prefill-tuned FA3 kernel (see
+        ``SM90_DECODE_LIKE_QO_THRESHOLD``). ``None`` (the default) preserves the
+        prior behavior exactly, so non-prefill callers are unaffected.
 
     Returns
     -------
@@ -513,6 +554,15 @@ def determine_attention_backend(
         dtype_q,
         dtype_kv,
     ):
+        # Decode-like short-query shapes belong on FA2 on SM90 (GQA reuse +
+        # split-KV). See SM90_DECODE_LIKE_QO_THRESHOLD above for the mechanism and
+        # the measured H100 data justifying the threshold and the dtype gate.
+        if (
+            max_qo_len is not None
+            and max_qo_len <= SM90_DECODE_LIKE_QO_THRESHOLD
+            and dtype_kv in (torch.float16, torch.bfloat16)
+        ):
+            return "fa2"
         return "fa3"
     else:
         return "fa2"
