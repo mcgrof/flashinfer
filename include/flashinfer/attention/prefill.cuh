@@ -738,26 +738,31 @@ __device__ __forceinline__ void build_folded_query(
 template <typename KTraits>
 __device__ __forceinline__ void build_position_basis(
     typename KTraits::SharedStorage* smem_storage, const uint32_t kv_idx_base,
-    const float rope_rcp_scale, const float rope_rcp_theta, const uint32_t tidx) {
+    const float rope_rcp_scale, const float rope_rcp_theta, const uint32_t warp_kv_idx,
+    const uint32_t lane_idx) {
   using DTypeQ = typename KTraits::DTypeQ;
   constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
   constexpr uint32_t HALF = HEAD_DIM / 2;
   constexpr uint32_t PER = 8;
   constexpr uint32_t CHUNKS = HALF / PER;
-  constexpr uint32_t ROW_STEP = KTraits::NUM_THREADS / CHUNKS;
+  // Each warp generates only the basis rows its own correction matmul
+  // reads, so no block-wide barrier is needed around this pass.
+  constexpr uint32_t ROW_STEP = 32 / CHUNKS;
+  constexpr uint32_t OWN_ROWS = KTraits::NUM_MMA_KV * 16;
   smem_t<KTraits::SWIZZLE_MODE_Q> psi(smem_storage->psi_smem);
-  const uint32_t c = tidx % CHUNKS, r0 = tidx / CHUNKS;
+  const uint32_t c = lane_idx % CHUNKS, r0 = lane_idx / CHUNKS;
+  const uint32_t row_base = warp_kv_idx * OWN_ROWS;
   float q_re[PER], q_im[PER], s_re[PER], s_im[PER];
 #pragma unroll
   for (uint32_t l = 0; l < PER; ++l) {
     const uint32_t f = c * PER + l;
     const float freq =
         rope_rcp_scale * __powf(rope_rcp_theta, float(2 * f) / float(HEAD_DIM));
-    __sincosf(float(kv_idx_base + r0) * freq, &q_im[l], &q_re[l]);
+    __sincosf(float(kv_idx_base + row_base + r0) * freq, &q_im[l], &q_re[l]);
     __sincosf(float(ROW_STEP) * freq, &s_im[l], &s_re[l]);
   }
 #pragma unroll 2
-  for (uint32_t row = r0; row < KTraits::CTA_TILE_KV; row += ROW_STEP) {
+  for (uint32_t row = row_base + r0; row < row_base + OWN_ROWS; row += ROW_STEP) {
     alignas(16) DTypeQ oc[PER], os[PER];
 #pragma unroll
     for (uint32_t l = 0; l < PER; ++l) {
@@ -771,6 +776,8 @@ __device__ __forceinline__ void build_position_basis(
     psi.base[psi.template get_permuted_offset<KTraits::UPCAST_STRIDE_Q>(row, c + CHUNKS)] =
         *(b128_t*)os;
   }
+  // Only this warp reads these rows, so a warp-level fence is enough.
+  __syncwarp();
 }
 
 // Add the bias contribution to the scores with one extra matmul over
@@ -2917,11 +2924,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         if (prebias_coeff_base != nullptr) {
           build_position_basis<KTraits>(
               &smem_storage, chunk_start + iter * CTA_TILE_KV, params.rope_rcp_scale,
-              params.rope_rcp_theta, (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
-          block.sync();
+              params.rope_rcp_theta, get_warp_idx_kv<KTraits>(tid.z), lane_idx);
           compute_score_correction<KTraits>(&smem_storage, &qt_smem_offset_r, &psi_smem_offset_r,
                                             s_frag);
-          block.sync();
         }
       }
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
