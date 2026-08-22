@@ -443,7 +443,7 @@ def get_single_prefill_module(backend, *args):
 
 
 @functools.cache
-def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
+def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None, use_prebias=False):
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
@@ -451,8 +451,12 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
-        uri = get_batch_prefill_uri(backend, *args, dtype_k=dtype_k, dtype_v=dtype_v)
-        module = gen_batch_prefill_module(backend, *args, dtype_k=dtype_k, dtype_v=dtype_v).build_and_load()
+        uri = get_batch_prefill_uri(
+            backend, *args, dtype_k=dtype_k, dtype_v=dtype_v, use_prebias=use_prebias
+        )
+        module = gen_batch_prefill_module(
+            backend, *args, dtype_k=dtype_k, dtype_v=dtype_v, use_prebias=use_prebias
+        ).build_and_load()
         plan_func = module.plan
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
@@ -497,6 +501,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
         scale_q: Optional[torch.Tensor] = None,
         scale_k: Optional[torch.Tensor] = None,
         scale_v: Optional[torch.Tensor] = None,
+        maybe_prebias_coeff: Optional[torch.Tensor] = None,
     ) -> None:
         # Check if FP8 by presence of scale tensors
         is_fp8 = scale_q is not None
@@ -523,6 +528,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                *((maybe_prebias_coeff,) if use_prebias else ()),
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -615,6 +621,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
         rope_scale: float,
         rope_theta: float,
         token_pos_in_items_len: int,
+        maybe_prebias_coeff: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -678,6 +685,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        maybe_prebias_coeff: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -741,6 +749,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
                 maybe_prefix_len_ptr,
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
+                *((maybe_prebias_coeff,) if use_prebias else ()),
                 logits_soft_cap,
                 sm_scale,
                 1.0 / rope_scale,  # rope_rcp_scale
@@ -854,6 +863,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        maybe_prebias_coeff: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 

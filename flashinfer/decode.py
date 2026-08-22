@@ -858,6 +858,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         *,
         k_data_type: Optional[Union[str, torch.dtype]] = None,
         v_data_type: Optional[Union[str, torch.dtype]] = None,
+        use_prebias: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -1095,6 +1096,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         self._backend = "fa2"
+                self._use_prebias = use_prebias
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -1109,6 +1111,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     False,  # use_fp16_qk_reduction
                     dtype_k=k_data_type,
                     dtype_v=v_data_type,
+                    use_prebias=use_prebias,
                 )
 
             args = [
@@ -1263,6 +1266,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: Optional[int] = 1,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        prebias_coeff: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1459,6 +1463,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "maybe_prebias_coeff": lambda: prebias_coeff,
                         },
                         args,
                     )
@@ -1502,7 +1507,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     True,  # uses_shared_paged_kv_idx
                 ]
 
-            self._cached_module.paged_run(*run_args)
+            self._cached_module.paged_run(
+                *run_args, maybe_prebias_coeff=prebias_coeff
+            )
         else:
             # trtllm-gen does not need plan info
             if self._backend == "trtllm-gen" and self._plan_info is None:

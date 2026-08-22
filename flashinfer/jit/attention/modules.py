@@ -411,6 +411,7 @@ def get_batch_prefill_uri(
     *,
     dtype_k: Optional[torch.dtype] = None,
     dtype_v: Optional[torch.dtype] = None,
+    use_prebias: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -422,7 +423,9 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_prebias" if use_prebias else "")
+        + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -1005,6 +1008,7 @@ def gen_batch_prefill_module(
     *,
     dtype_k: Optional[torch.dtype] = None,
     dtype_v: Optional[torch.dtype] = None,
+    use_prebias: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -1020,6 +1024,7 @@ def gen_batch_prefill_module(
         use_fp16_qk_reduction,
         dtype_k=dtype_k,
         dtype_v=dtype_v,
+        use_prebias=use_prebias,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1052,6 +1057,9 @@ def gen_batch_prefill_module(
             "uint16_t",
             "uint16_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
+        if use_prebias:
+            additional_tensor_names.append("maybe_prebias_coeff")
+            additional_tensor_dtypes.append("float")
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",

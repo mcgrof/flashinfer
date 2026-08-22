@@ -47,6 +47,8 @@ DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 
 namespace cg = cooperative_groups;
+
+DEFINE_HAS_MEMBER(maybe_prebias_coeff)
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
 
@@ -242,6 +244,27 @@ __device__ __forceinline__ void k_frag_apply_llama_rope(T* x_first_half, T* x_se
     tmp = x_first_half[reg_id];
     x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin);
     x_second_half[reg_id] = ((float)x_second_half[reg_id] * cos + tmp * sin);
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ void k_frag_add_rotated_bias(T* frag, const float* coeff,
+                                                        const float* rope_freq,
+                                                        const uint32_t dim_base,
+                                                        const uint32_t kv_offset,
+                                                        const uint32_t lane_idx) {
+  // FP8 K caches storing the pre-bias rotary residual RoPE_t(x W_k)
+  // reconstruct the rotated key-projection bias here:
+  //   RoPE_t(b)[d] = coeff[2d] * cos(t * freq_d) + coeff[2d+1] * sin(t * freq_d)
+  // with coeff precomputed on the host from b under the same
+  // non-interleaved pairing the rotary path above uses.
+#pragma unroll
+  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+    const uint32_t i = reg_id / 4, j = (reg_id % 4) / 2;
+    const uint32_t d = dim_base + 8 * j + (lane_idx % 4) * 2 + (reg_id % 2);
+    float sin, cos;
+    __sincosf(float(kv_offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin, &cos);
+    frag[reg_id] = T(float(frag[reg_id]) + coeff[2 * d] * cos + coeff[2 * d + 1] * sin);
   }
 }
 
@@ -657,11 +680,13 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
   }
 }
 
-template <typename KTraits>
+template <typename KTraits, bool HAS_PREBIAS = false>
 __device__ __forceinline__ void compute_qk(
     smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
     smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r,
-    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    const float* prebias_coeff = nullptr, const float (*rope_freq)[4] = nullptr,
+    const uint32_t kv_idx_base = 0, const uint32_t lane_idx = 0) {
   constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
   constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;
   uint32_t a_frag[KTraits::NUM_MMA_Q][4], b_frag[4];
@@ -693,6 +718,15 @@ __device__ __forceinline__ void compute_qk(
         b_frag_f8[1] = frag_layout_swizzle_16b_to_8b(b_frag_f8[1]);
         vec_cast<typename KTraits::DTypeQ, typename KTraits::DTypeK>::cast<8>(
             (typename KTraits::DTypeQ*)b_frag, (typename KTraits::DTypeK*)b_frag_f8);
+        if constexpr (HAS_PREBIAS) {
+          // a prebias-capable module may still serve biasless layers
+          if (prebias_coeff != nullptr) {
+            k_frag_add_rotated_bias<typename KTraits::DTypeQ>(
+                (typename KTraits::DTypeQ*)b_frag, prebias_coeff,
+                rope_freq[mma_d % (KTraits::NUM_MMA_D_QK / 2)], mma_d * 16,
+                kv_idx_base + mma_kv * 16 + lane_idx / 4, lane_idx);
+          }
+        }
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
@@ -1900,10 +1934,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     float d[NUM_MMA_Q][2];
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
+    const float* prebias_coeff_base = nullptr;
+    if constexpr (has_maybe_prebias_coeff_v<Params>) {
+      prebias_coeff_base = params.maybe_prebias_coeff;
+    }
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
       const float rope_rcp_theta = params.rope_rcp_theta;
       init_rope_freq<KTraits>(rope_freq, rope_rcp_scale, rope_rcp_theta, tid.x);
+    } else if constexpr (has_maybe_prebias_coeff_v<Params>) {
+      init_rope_freq<KTraits>(rope_freq, params.rope_rcp_scale, params.rope_rcp_theta, tid.x);
     }
     init_states<KTraits>(variant, o_frag, m, d);
 
@@ -2029,9 +2069,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       }
 
       // compute attention score
-      compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      const float* prebias_coeff_head =
+          prebias_coeff_base == nullptr
+              ? nullptr
+              : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16;
+      compute_qk<KTraits, has_maybe_prebias_coeff_v<Params>>(
+          &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, prebias_coeff_head,
+          rope_freq, kv_idx_base, lane_idx);
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
@@ -2223,10 +2269,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     float d[NUM_MMA_Q][2];
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
+    const float* prebias_coeff_base = nullptr;
+    if constexpr (has_maybe_prebias_coeff_v<Params>) {
+      prebias_coeff_base = params.maybe_prebias_coeff;
+    }
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
       const float rope_rcp_theta = params.rope_rcp_theta;
       init_rope_freq<KTraits>(rope_freq, rope_rcp_scale, rope_rcp_theta, tid.x);
+    } else if constexpr (has_maybe_prebias_coeff_v<Params>) {
+      init_rope_freq<KTraits>(rope_freq, params.rope_rcp_scale, params.rope_rcp_theta, tid.x);
     }
     init_states<KTraits>(variant, o_frag, m, d);
 
@@ -2410,9 +2462,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
 
       // compute attention score
-      compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
+      const float* prebias_coeff_head =
+          prebias_coeff_base == nullptr
+              ? nullptr
+              : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16;
+      compute_qk<KTraits, has_maybe_prebias_coeff_v<Params>>(
+          &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, prebias_coeff_head,
+          rope_freq, kv_idx_base, lane_idx);
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
