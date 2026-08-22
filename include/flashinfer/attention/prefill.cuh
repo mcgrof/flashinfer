@@ -73,6 +73,14 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
   }
 }
 
+// Compile the score-domain bias correction.  The bias contribution to
+// a score factorises into a per-query-head vector against a
+// per-position cosine/sine basis, so it can be applied as one extra
+// matmul over the whole tile instead of an add on every key element.
+#ifndef FLASHINFER_PREBIAS_SCORE
+#define FLASHINFER_PREBIAS_SCORE 0
+#endif
+
 // Compile the staged FP8-to-16-bit key expansion.  Measured slower
 // than a 16-bit key cache in both layouts; retained as a control.
 #ifndef FLASHINFER_PREBIAS_STAGED
@@ -114,7 +122,7 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename DTypeK = DTypeKV, typename DTypeV = DTypeKV, bool K_STAGED = false,
-          typename DTypeKGmem = DTypeK>
+          typename DTypeKGmem = DTypeK, bool SCORE_CORR = false>
 struct SharedStorageQKVO {
   union {
     struct {
@@ -126,6 +134,13 @@ struct SharedStorageQKVO {
       // k_smem above.  Collapses to one slot when not staging.
       alignas(16) std::conditional_t<K_STAGED, DTypeKGmem[CTA_TILE_KV * HEAD_DIM_QK],
                                      DTypeKGmem[16]> k_stage_smem;
+      // Score-domain correction operands: the query folded against the
+      // bias coefficients, and the cosine/sine basis for this tile's
+      // positions.  Both collapse to one slot when not compiled in.
+      alignas(16) std::conditional_t<SCORE_CORR, DTypeQ[CTA_TILE_Q * HEAD_DIM_QK],
+                                     DTypeQ[8]> qt_smem;
+      alignas(16) std::conditional_t<SCORE_CORR, DTypeQ[CTA_TILE_KV * HEAD_DIM_QK],
+                                     DTypeQ[8]> psi_smem;
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
       alignas(
@@ -148,8 +163,10 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
           typename AttentionVariant_, typename DTypeV_ = DTypeKV_, bool K_STAGED_ = false,
-          typename DTypeKGmem_ = DTypeKV_>
+          typename DTypeKGmem_ = DTypeKV_, bool SCORE_CORR_ = false>
 struct KernelTraits {
+  // Score-domain bias correction compiled in.
+  static constexpr bool SCORE_CORR = SCORE_CORR_;
   // Staged pre-bias K: the global-memory K cache is one byte wide
   // (DTypeKGmem_) while the shared-memory tile and the QK loop use the
   // 16-bit DTypeKV_.  A producer stages the one-byte tile and a
@@ -217,7 +234,7 @@ struct KernelTraits {
   // dtype.  Today both equal DTypeKV; FI-3 will let them diverge.
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
                                           HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
-                                          DTypeK, DTypeV, K_STAGED_, DTypeKGmem_>;
+                                          DTypeK, DTypeV, K_STAGED_, DTypeKGmem_, SCORE_CORR_>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -667,6 +684,128 @@ __device__ __forceinline__ void k_smem_stage_convert_warp_local(
   }
   // Only this warp reads these rows, so a warp-level fence is enough.
   __syncwarp();
+}
+
+// Fold the query against the bias coefficients, once per threadblock.
+// The bias contribution to a score is
+//   sum_f (q_f c1_f + q_{f+H} c1_{f+H}) cos(t f) + (q_f c2_f + q_{f+H} c2_{f+H}) sin(t f)
+// so the two bracketed terms form a per-query vector that multiplies a
+// per-position cosine/sine basis.  This builds that vector in the same
+// layout the score matmul already reads queries from.
+template <typename KTraits>
+__device__ __forceinline__ void build_folded_query(
+    smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, typename KTraits::SharedStorage* smem_storage,
+    const float* prebias_coeff, const uint32_t tidx) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t HALF = HEAD_DIM / 2;
+  constexpr uint32_t PER = 8;                       // elements in one 16-byte slot
+  constexpr uint32_t CHUNKS = HALF / PER;           // slots spanning the cosine half
+  constexpr uint32_t ROW_STEP = KTraits::NUM_THREADS / CHUNKS;
+  smem_t<KTraits::SWIZZLE_MODE_Q> qt(smem_storage->qt_smem);
+  const uint32_t c = tidx % CHUNKS, r0 = tidx / CHUNKS;
+  float c1lo[PER], c1hi[PER], c2lo[PER], c2hi[PER];
+#pragma unroll
+  for (uint32_t l = 0; l < PER; ++l) {
+    const uint32_t f = c * PER + l;
+    const float2 lo = *(const float2*)(prebias_coeff + 2 * f);
+    const float2 hi = *(const float2*)(prebias_coeff + 2 * (f + HALF));
+    c1lo[l] = lo.x; c2lo[l] = lo.y; c1hi[l] = hi.x; c2hi[l] = hi.y;
+  }
+#pragma unroll 2
+  for (uint32_t row = r0; row < KTraits::CTA_TILE_Q; row += ROW_STEP) {
+    const b128_t qlo =
+        q_smem->base[q_smem->template get_permuted_offset<KTraits::UPCAST_STRIDE_Q>(row, c)];
+    const b128_t qhi = q_smem->base[q_smem->template get_permuted_offset<KTraits::UPCAST_STRIDE_Q>(
+        row, c + CHUNKS)];
+    alignas(16) DTypeQ outlo[PER], outhi[PER];
+#pragma unroll
+    for (uint32_t l = 0; l < PER; ++l) {
+      const float a = float(((const DTypeQ*)&qlo)[l]), b = float(((const DTypeQ*)&qhi)[l]);
+      outlo[l] = DTypeQ(a * c1lo[l] + b * c1hi[l]);   // multiplies cos(t f)
+      outhi[l] = DTypeQ(a * c2lo[l] + b * c2hi[l]);   // multiplies sin(t f)
+    }
+    qt.base[qt.template get_permuted_offset<KTraits::UPCAST_STRIDE_Q>(row, c)] = *(b128_t*)outlo;
+    qt.base[qt.template get_permuted_offset<KTraits::UPCAST_STRIDE_Q>(row, c + CHUNKS)] =
+        *(b128_t*)outhi;
+  }
+}
+
+// Generate the cosine/sine basis for this tile's key positions.  Each
+// thread owns a few frequencies and walks its rows by phase recurrence,
+// so the whole tile costs one transcendental per frequency rather than
+// any per-key-element work, and nothing is read from memory.
+template <typename KTraits>
+__device__ __forceinline__ void build_position_basis(
+    typename KTraits::SharedStorage* smem_storage, const uint32_t kv_idx_base,
+    const float rope_rcp_scale, const float rope_rcp_theta, const uint32_t tidx) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t HALF = HEAD_DIM / 2;
+  constexpr uint32_t PER = 8;
+  constexpr uint32_t CHUNKS = HALF / PER;
+  constexpr uint32_t ROW_STEP = KTraits::NUM_THREADS / CHUNKS;
+  smem_t<KTraits::SWIZZLE_MODE_Q> psi(smem_storage->psi_smem);
+  const uint32_t c = tidx % CHUNKS, r0 = tidx / CHUNKS;
+  float q_re[PER], q_im[PER], s_re[PER], s_im[PER];
+#pragma unroll
+  for (uint32_t l = 0; l < PER; ++l) {
+    const uint32_t f = c * PER + l;
+    const float freq =
+        rope_rcp_scale * __powf(rope_rcp_theta, float(2 * f) / float(HEAD_DIM));
+    __sincosf(float(kv_idx_base + r0) * freq, &q_im[l], &q_re[l]);
+    __sincosf(float(ROW_STEP) * freq, &s_im[l], &s_re[l]);
+  }
+#pragma unroll 2
+  for (uint32_t row = r0; row < KTraits::CTA_TILE_KV; row += ROW_STEP) {
+    alignas(16) DTypeQ oc[PER], os[PER];
+#pragma unroll
+    for (uint32_t l = 0; l < PER; ++l) {
+      oc[l] = DTypeQ(q_re[l]);
+      os[l] = DTypeQ(q_im[l]);
+      const float nr = q_re[l] * s_re[l] - q_im[l] * s_im[l];
+      q_im[l] = q_im[l] * s_re[l] + q_re[l] * s_im[l];
+      q_re[l] = nr;
+    }
+    psi.base[psi.template get_permuted_offset<KTraits::UPCAST_STRIDE_Q>(row, c)] = *(b128_t*)oc;
+    psi.base[psi.template get_permuted_offset<KTraits::UPCAST_STRIDE_Q>(row, c + CHUNKS)] =
+        *(b128_t*)os;
+  }
+}
+
+// Add the bias contribution to the scores with one extra matmul over
+// the tile.  Same shape and accumulator as the score matmul itself,
+// both operands 16-bit, always accumulating onto the existing scores.
+template <typename KTraits>
+__device__ __forceinline__ void compute_score_correction(
+    typename KTraits::SharedStorage* smem_storage, uint32_t* qt_smem_offset_r,
+    uint32_t* psi_smem_offset_r,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  constexpr uint32_t STRIDE = KTraits::UPCAST_STRIDE_Q;
+  smem_t<KTraits::SWIZZLE_MODE_Q> qt(smem_storage->qt_smem), psi(smem_storage->psi_smem);
+  uint32_t a_frag[KTraits::NUM_MMA_Q][4], b_frag[4];
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK; ++mma_d) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      qt.ldmatrix_m8n8x4(*qt_smem_offset_r, a_frag[mma_q]);
+      *qt_smem_offset_r = qt.template advance_offset_by_row<16, STRIDE>(*qt_smem_offset_r);
+    }
+    *qt_smem_offset_r = qt.template advance_offset_by_column<2>(*qt_smem_offset_r, mma_d) -
+                        KTraits::NUM_MMA_Q * 16 * STRIDE;
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+      psi.ldmatrix_m8n8x4(*psi_smem_offset_r, b_frag);
+      *psi_smem_offset_r = psi.template advance_offset_by_row<16, STRIDE>(*psi_smem_offset_r);
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, MMAMode::kInplaceUpdate>(
+            s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+      }
+    }
+    *psi_smem_offset_r = psi.template advance_offset_by_column<2>(*psi_smem_offset_r, mma_d) -
+                         KTraits::NUM_MMA_KV * 16 * STRIDE;
+  }
 }
 
 template <typename KTraits>
@@ -2569,6 +2708,18 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       block.sync();
     }
 
+    if constexpr (KTraits::SCORE_CORR) {
+      cp_async::wait_group<0>();
+      block.sync();
+      if (prebias_coeff_base != nullptr) {
+        build_folded_query<KTraits>(
+            &qo_smem, &smem_storage,
+            prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16,
+            (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
+      }
+      block.sync();
+    }
+
     smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
     // FI-4d: K and V may have different dtypes in asym mode, and the
     // per-lane element offset depends on upcast_size<T>.  Compute two
@@ -2596,6 +2747,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
              v_smem_offset_w = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
                  warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                  lane_idx % KV_THR_LAYOUT_COL);
+    uint32_t qt_smem_offset_r = smem_t<SWIZZLE_MODE_Q>::template get_permuted_offset<
+               KTraits::UPCAST_STRIDE_Q>(
+               get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16),
+             psi_smem_offset_r = smem_t<SWIZZLE_MODE_Q>::template get_permuted_offset<
+                 KTraits::UPCAST_STRIDE_Q>(
+                 get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16, lane_idx / 16);
     const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
     uint32_t packed_page_iter_base =
@@ -2744,9 +2901,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           prebias_coeff_base == nullptr
               ? nullptr
               : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16;
-      compute_qk<KTraits, has_maybe_prebias_coeff_v<Params> && !KTraits::K_STAGED>(
+      compute_qk<KTraits, has_maybe_prebias_coeff_v<Params> && !KTraits::K_STAGED &&
+                       !KTraits::SCORE_CORR>(
           &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, prebias_coeff_head,
           rope_freq, prebias_rope_table, KTraits::NUM_MMA_D_QK * 16, kv_idx_base, lane_idx);
+      if constexpr (KTraits::SCORE_CORR) {
+        if (prebias_coeff_base != nullptr) {
+          build_position_basis<KTraits>(
+              &smem_storage, chunk_start + iter * CTA_TILE_KV, params.rope_rcp_scale,
+              params.rope_rcp_theta, (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
+          block.sync();
+          compute_score_correction<KTraits>(&smem_storage, &qt_smem_offset_r, &psi_smem_offset_r,
+                                            s_frag);
+          block.sync();
+        }
+      }
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
@@ -3056,9 +3225,14 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // result and is compiled only when explicitly asked for.
   constexpr bool K_STAGED =
       FLASHINFER_PREBIAS_STAGED && has_maybe_prebias_coeff_v<Params> && sizeof(DTypeK) == 1;
+  // The score-domain correction leaves the key cache one byte wide and
+  // instead holds a 16-bit basis tile for the tile's positions.
+  constexpr bool SCORE_CORR =
+      FLASHINFER_PREBIAS_SCORE && has_maybe_prebias_coeff_v<Params>;
   using DTypeKSmem = std::conditional_t<K_STAGED, DTypeQ, DTypeKV>;
-  constexpr size_t K_SMEM_BYTES =
-      K_STAGED ? sizeof(DTypeQ) + sizeof(DTypeK) : sizeof(DTypeK);
+  constexpr size_t K_SMEM_BYTES = (K_STAGED ? sizeof(DTypeQ) + sizeof(DTypeK)
+                                            : sizeof(DTypeK)) +
+                                  (SCORE_CORR ? sizeof(DTypeQ) : 0);
   // we expect each sm execute two threadblocks
   // FI-2: split K-half and V-half byte sizing.
   const int num_ctas_per_sm =
@@ -3086,7 +3260,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                      NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKSmem, DTypeO,
                      DTypeQKAccum, typename Params::IdType, AttentionVariant,
-                     DTypeV, K_STAGED, DTypeK>;
+                     DTypeV, K_STAGED, DTypeK, SCORE_CORR>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
