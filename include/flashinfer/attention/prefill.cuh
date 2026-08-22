@@ -806,6 +806,10 @@ __device__ __forceinline__ void compute_score_correction(
     *psi_smem_offset_r = psi.template advance_offset_by_column<2>(*psi_smem_offset_r, mma_d) -
                          KTraits::NUM_MMA_KV * 16 * STRIDE;
   }
+  // Leave both read offsets where they started so the next tile reads
+  // from the top, the same contract compute_qk keeps.
+  *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+  *psi_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
 }
 
 template <typename KTraits>
@@ -2750,9 +2754,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     uint32_t qt_smem_offset_r = smem_t<SWIZZLE_MODE_Q>::template get_permuted_offset<
                KTraits::UPCAST_STRIDE_Q>(
                get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16),
+             // The basis feeds the matmul in the same operand position as
+             // the keys, so it uses the key-side lane mapping.
              psi_smem_offset_r = smem_t<SWIZZLE_MODE_Q>::template get_permuted_offset<
                  KTraits::UPCAST_STRIDE_Q>(
-                 get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16, lane_idx / 16);
+                 get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
+                     lane_idx % 8,
+                 (lane_idx % 16) / 8);
     const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
     uint32_t packed_page_iter_base =
