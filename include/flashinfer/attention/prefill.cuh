@@ -615,12 +615,15 @@ __device__ __forceinline__ void k_smem_stage_convert_warp_local(
   const uint32_t r0 = lane_idx / CHUNKS;
   const uint32_t row_base = warp_kv_idx * OWN_ROWS;
 
-  // Phase recurrence.  A thread walks many rows at one fixed set of 16
-  // frequencies, and consecutive rows it owns are a constant ROW_STEP
-  // apart, so advancing a row is a fixed rotation per dimension.  Pay
-  // the transcendental once per dimension and then step with a complex
-  // multiply, instead of a sine and a cosine per key element.
-  float cur_c[16], cur_s[16], stp_c[16], stp_s[16];
+  // Phase recurrence with the coefficient folded in.  A thread walks
+  // many rows at one fixed set of 16 frequencies, and the rows it owns
+  // are a constant ROW_STEP apart, so advancing a row is a fixed
+  // rotation per dimension.  Writing the wanted value as the real part
+  // of (c1 - i c2) e^{i t f} lets the coefficient be absorbed into the
+  // starting phase once per tile: the inner loop then needs no
+  // coefficient load, no table, and no transcendental, just one complex
+  // multiply and one add per key element.
+  float q_re[16], q_im[16], s_re[16], s_im[16];
   if constexpr (HAS_PREBIAS) {
     if (prebias_coeff != nullptr) {
       const float pos0 = float(kv_idx_base + row_base + r0);
@@ -629,8 +632,12 @@ __device__ __forceinline__ void k_smem_stage_convert_warp_local(
         const uint32_t d = c * 16 + l;
         const float f = rope_rcp_scale *
                         __powf(rope_rcp_theta, float(2 * (d % (HEAD_DIM / 2))) / float(HEAD_DIM));
-        __sincosf(pos0 * f, &cur_s[l], &cur_c[l]);
-        __sincosf(float(ROW_STEP) * f, &stp_s[l], &stp_c[l]);
+        float s0, c0;
+        __sincosf(pos0 * f, &s0, &c0);
+        __sincosf(float(ROW_STEP) * f, &s_im[l], &s_re[l]);
+        const float2 cc = *(const float2*)(prebias_coeff + 2 * d);
+        q_re[l] = cc.x * c0 + cc.y * s0;
+        q_im[l] = cc.x * s0 - cc.y * c0;
       }
     }
   }
@@ -645,12 +652,11 @@ __device__ __forceinline__ void k_smem_stage_convert_warp_local(
       if (prebias_coeff != nullptr) {
 #pragma unroll
         for (uint32_t l = 0; l < 16; ++l) {
-          const float2 cc = *(const float2*)(prebias_coeff + 2 * (c * 16 + l));
-          out[l] = DTypeK(float(out[l]) + cc.x * cur_c[l] + cc.y * cur_s[l]);
+          out[l] = DTypeK(float(out[l]) + q_re[l]);
           // advance this dimension to the next row this thread owns
-          const float nc = cur_c[l] * stp_c[l] - cur_s[l] * stp_s[l];
-          cur_s[l] = cur_s[l] * stp_c[l] + cur_c[l] * stp_s[l];
-          cur_c[l] = nc;
+          const float nr = q_re[l] * s_re[l] - q_im[l] * s_im[l];
+          q_im[l] = q_im[l] * s_re[l] + q_re[l] * s_im[l];
+          q_re[l] = nr;
         }
       }
     }
