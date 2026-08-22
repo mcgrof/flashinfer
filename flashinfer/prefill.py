@@ -1710,6 +1710,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_prebias: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -2038,10 +2039,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_fp16_qk_reduction,
                 )
 
+                self._use_prebias = use_prebias
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args,
                     dtype_k=k_data_type,
                     dtype_v=v_data_type,
+                    use_prebias=use_prebias,
                 )
 
         self._block_tables = block_tables
@@ -2193,6 +2196,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sinks: Optional[torch.Tensor] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        prebias_coeff: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2504,7 +2508,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
-            self._cached_module.paged_run(*run_args)
+            self._cached_module.paged_run(
+                *run_args, maybe_prebias_coeff=prebias_coeff
+            )
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
             if v_scale is not None and not is_float_one:
