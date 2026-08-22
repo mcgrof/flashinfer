@@ -615,14 +615,22 @@ __device__ __forceinline__ void k_smem_stage_convert_warp_local(
   const uint32_t r0 = lane_idx / CHUNKS;
   const uint32_t row_base = warp_kv_idx * OWN_ROWS;
 
-  float freq[16];
+  // Phase recurrence.  A thread walks many rows at one fixed set of 16
+  // frequencies, and consecutive rows it owns are a constant ROW_STEP
+  // apart, so advancing a row is a fixed rotation per dimension.  Pay
+  // the transcendental once per dimension and then step with a complex
+  // multiply, instead of a sine and a cosine per key element.
+  float cur_c[16], cur_s[16], stp_c[16], stp_s[16];
   if constexpr (HAS_PREBIAS) {
     if (prebias_coeff != nullptr) {
+      const float pos0 = float(kv_idx_base + row_base + r0);
 #pragma unroll
       for (uint32_t l = 0; l < 16; ++l) {
         const uint32_t d = c * 16 + l;
-        freq[l] = rope_rcp_scale *
-                  __powf(rope_rcp_theta, float(2 * (d % (HEAD_DIM / 2))) / float(HEAD_DIM));
+        const float f = rope_rcp_scale *
+                        __powf(rope_rcp_theta, float(2 * (d % (HEAD_DIM / 2))) / float(HEAD_DIM));
+        __sincosf(pos0 * f, &cur_s[l], &cur_c[l]);
+        __sincosf(float(ROW_STEP) * f, &stp_s[l], &stp_c[l]);
       }
     }
   }
@@ -635,13 +643,14 @@ __device__ __forceinline__ void k_smem_stage_convert_warp_local(
     vec_cast<DTypeK, DTypeKGmem>::template cast<16>(out, (DTypeKGmem*)&raw);
     if constexpr (HAS_PREBIAS) {
       if (prebias_coeff != nullptr) {
-        const float pos = float(kv_idx_base + row);
 #pragma unroll
         for (uint32_t l = 0; l < 16; ++l) {
           const float2 cc = *(const float2*)(prebias_coeff + 2 * (c * 16 + l));
-          float sin, cos;
-          __sincosf(pos * freq[l], &sin, &cos);
-          out[l] = DTypeK(float(out[l]) + cc.x * cos + cc.y * sin);
+          out[l] = DTypeK(float(out[l]) + cc.x * cur_c[l] + cc.y * cur_s[l]);
+          // advance this dimension to the next row this thread owns
+          const float nc = cur_c[l] * stp_c[l] - cur_s[l] * stp_s[l];
+          cur_s[l] = cur_s[l] * stp_c[l] + cur_c[l] * stp_s[l];
+          cur_c[l] = nc;
         }
       }
     }
