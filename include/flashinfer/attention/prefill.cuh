@@ -48,6 +48,31 @@ DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 
 namespace cg = cooperative_groups;
 
+// Table-driven variant of the rotated-bias add.  Reads the model's own
+// rotary cosine/sine table instead of evaluating the rotation, so the
+// key cache stays one byte wide in shared memory and no special
+// function unit work enters the score loop.  The table is the layout
+// the model already keeps: row `t` holds the cosines for every
+// frequency followed by the sines, `table_stride` elements per row.
+template <typename T>
+__device__ __forceinline__ void k_frag_add_rotated_bias_table(
+    T* frag, const float* coeff, const float* rope_table, const uint32_t table_stride,
+    const uint32_t dim_base, const uint32_t kv_offset, const uint32_t lane_idx) {
+  const uint32_t half = table_stride / 2;
+#pragma unroll
+  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+    const uint32_t i = reg_id / 4, j = (reg_id % 4) / 2;
+    const uint32_t d = dim_base + 8 * j + (lane_idx % 4) * 2 + (reg_id % 2);
+    const size_t row = size_t(kv_offset + 8 * i) * table_stride;
+    // A rotation pairs dimension d with d + half, so both share the
+    // frequency index d % half.
+    const uint32_t f = d % half;
+    const float cos = __ldg(rope_table + row + f);
+    const float sin = __ldg(rope_table + row + half + f);
+    frag[reg_id] = T(float(frag[reg_id]) + coeff[2 * d] * cos + coeff[2 * d + 1] * sin);
+  }
+}
+
 // Compile the staged FP8-to-16-bit key expansion.  Measured slower
 // than a 16-bit key cache in both layouts; retained as a control.
 #ifndef FLASHINFER_PREBIAS_STAGED
