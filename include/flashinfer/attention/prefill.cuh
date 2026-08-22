@@ -88,13 +88,19 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 // `v_smem` allocates FP8-sized slots.
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
-          typename DTypeK = DTypeKV, typename DTypeV = DTypeKV>
+          typename DTypeK = DTypeKV, typename DTypeV = DTypeKV, bool K_STAGED = false,
+          typename DTypeKGmem = DTypeK>
 struct SharedStorageQKVO {
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
       alignas(16) DTypeK k_smem[CTA_TILE_KV * HEAD_DIM_QK];
       alignas(16) DTypeV v_smem[CTA_TILE_KV * HEAD_DIM_VO];
+      // Landing area for the staged expansion variants: the producer
+      // parks the one-byte key tile here and a pre-pass expands it into
+      // k_smem above.  Collapses to one slot when not staging.
+      alignas(16) std::conditional_t<K_STAGED, DTypeKGmem[CTA_TILE_KV * HEAD_DIM_QK],
+                                     DTypeKGmem[16]> k_stage_smem;
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
       alignas(
@@ -186,7 +192,7 @@ struct KernelTraits {
   // dtype.  Today both equal DTypeKV; FI-3 will let them diverge.
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
                                           HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
-                                          DTypeK, DTypeV>;
+                                          DTypeK, DTypeV, K_STAGED_, DTypeKGmem_>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -475,10 +481,7 @@ __device__ __forceinline__ void page_produce_k_staged(
   // A one-byte staging row must span a full 128B swizzle period.
   static_assert(KTraits::NUM_MMA_D_QK * 16 >= 128,
                 "staged pre-bias K requires head_dim >= 128");
-  // The one-byte tile occupies the low half of the 16-bit K region:
-  // the expansion pre-pass reads it out before writing any 16-bit
-  // value back, so K shared memory stays at the 16-bit footprint.
-  smem_t<KTraits::SWIZZLE_MODE_KV> smem((DType*)smem_storage->k_smem);
+  smem_t<KTraits::SWIZZLE_MODE_KV> smem(smem_storage->k_stage_smem);
   constexpr SharedMemFillMode fill_mode = SharedMemFillMode::kNoFill;
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
   constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
@@ -522,27 +525,10 @@ __device__ __forceinline__ void k_smem_stage_convert(
   constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
   constexpr uint32_t CHUNKS = HEAD_DIM / 16;
   constexpr uint32_t ROW_STRIDE = KTraits::NUM_THREADS / CHUNKS;
-  constexpr uint32_t ROWS_PER_THREAD =
-      (KTraits::CTA_TILE_KV + ROW_STRIDE - 1) / ROW_STRIDE;
-  smem_t<KTraits::SWIZZLE_MODE_KV> stage((DTypeKGmem*)smem_storage->k_smem);
+  smem_t<KTraits::SWIZZLE_MODE_KV> stage(smem_storage->k_stage_smem);
   smem_t<KTraits::SWIZZLE_MODE_KV> k_smem(smem_storage->k_smem);
   const uint32_t tidx = warp_idx * 32 + lane_idx;
   const uint32_t c = tidx % CHUNKS;
-  const uint32_t row0 = tidx / CHUNKS;
-
-  // Read every one-byte value this thread owns into registers before
-  // the barrier; the 16-bit writes below overwrite the source region.
-  b128_t raw[ROWS_PER_THREAD];
-#pragma unroll
-  for (uint32_t r = 0; r < ROWS_PER_THREAD; ++r) {
-    const uint32_t row = row0 + r * ROW_STRIDE;
-    if (row < KTraits::CTA_TILE_KV) {
-      raw[r] = stage.base[stage.template get_permuted_offset<KTraits::UPCAST_STRIDE_K_STAGE>(
-          row, c)];
-    }
-  }
-  __syncthreads();
-
   float freq[16];
   if constexpr (HAS_PREBIAS) {
     if (prebias_coeff != nullptr) {
@@ -554,12 +540,12 @@ __device__ __forceinline__ void k_smem_stage_convert(
       }
     }
   }
-#pragma unroll
-  for (uint32_t r = 0; r < ROWS_PER_THREAD; ++r) {
-    const uint32_t row = row0 + r * ROW_STRIDE;
-    if (row >= KTraits::CTA_TILE_KV) continue;
+#pragma unroll 4
+  for (uint32_t row = tidx / CHUNKS; row < KTraits::CTA_TILE_KV; row += ROW_STRIDE) {
+    b128_t raw =
+        stage.base[stage.template get_permuted_offset<KTraits::UPCAST_STRIDE_K_STAGE>(row, c)];
     alignas(16) DTypeK out[16];
-    vec_cast<DTypeK, DTypeKGmem>::template cast<16>(out, (DTypeKGmem*)&raw[r]);
+    vec_cast<DTypeK, DTypeKGmem>::template cast<16>(out, (DTypeKGmem*)&raw);
     if constexpr (HAS_PREBIAS) {
       if (prebias_coeff != nullptr) {
         const float pos = float(kv_idx_base + row);
@@ -579,29 +565,68 @@ __device__ __forceinline__ void k_smem_stage_convert(
   }
 }
 
-// Table-driven variant of the rotated-bias add.  Reads the model's own
-// rotary cosine/sine table instead of evaluating the rotation, so the
-// key cache stays one byte wide in shared memory and no special
-// function unit work enters the score loop.  The table is the layout
-// the model already keeps: row `t` holds the cosines for every
-// frequency followed by the sines, `table_stride` elements per row.
-template <typename T>
-__device__ __forceinline__ void k_frag_add_rotated_bias_table(
-    T* frag, const float* coeff, const float* rope_table, const uint32_t table_stride,
-    const uint32_t dim_base, const uint32_t kv_offset, const uint32_t lane_idx) {
-  const uint32_t half = table_stride / 2;
+// Overlapped variant of the staged expansion.  Each warp converts only
+// the key rows it will itself consume, which is exactly the range its
+// own score-loop offset reads, so the block-wide barrier between the
+// conversion and the matmul disappears and one warp's conversion can
+// overlap another warp's matmul.  This is the arrangement that tests
+// whether the serial schedule, rather than the expansion itself, was
+// what the block-wide version measured.
+template <typename KTraits, bool HAS_PREBIAS>
+__device__ __forceinline__ void k_smem_stage_convert_warp_local(
+    typename KTraits::SharedStorage* smem_storage, const uint32_t kv_idx_base,
+    const float* prebias_coeff, const float rope_rcp_scale, const float rope_rcp_theta,
+    const uint32_t warp_kv_idx, const uint32_t lane_idx) {
+  using DTypeK = typename KTraits::DTypeKV;
+  using DTypeKGmem = typename KTraits::DTypeKGmem;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t CHUNKS = HEAD_DIM / 16;
+  constexpr uint32_t OWN_ROWS = KTraits::NUM_MMA_KV * 16;
+  constexpr uint32_t ROW_STEP = 32 / CHUNKS;
+  static_assert(CHUNKS <= 32 && 32 % CHUNKS == 0, "one warp must tile a row evenly");
+  smem_t<KTraits::SWIZZLE_MODE_KV> stage(smem_storage->k_stage_smem);
+  smem_t<KTraits::SWIZZLE_MODE_KV> k_smem(smem_storage->k_smem);
+  const uint32_t c = lane_idx % CHUNKS;
+  const uint32_t r0 = lane_idx / CHUNKS;
+  const uint32_t row_base = warp_kv_idx * OWN_ROWS;
+
+  float freq[16];
+  if constexpr (HAS_PREBIAS) {
+    if (prebias_coeff != nullptr) {
 #pragma unroll
-  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-    const uint32_t i = reg_id / 4, j = (reg_id % 4) / 2;
-    const uint32_t d = dim_base + 8 * j + (lane_idx % 4) * 2 + (reg_id % 2);
-    const size_t row = size_t(kv_offset + 8 * i) * table_stride;
-    // A rotation pairs dimension d with d + half, so both share the
-    // frequency index d % half.
-    const uint32_t f = d % half;
-    const float cos = __ldg(rope_table + row + f);
-    const float sin = __ldg(rope_table + row + half + f);
-    frag[reg_id] = T(float(frag[reg_id]) + coeff[2 * d] * cos + coeff[2 * d + 1] * sin);
+      for (uint32_t l = 0; l < 16; ++l) {
+        const uint32_t d = c * 16 + l;
+        freq[l] = rope_rcp_scale *
+                  __powf(rope_rcp_theta, float(2 * (d % (HEAD_DIM / 2))) / float(HEAD_DIM));
+      }
+    }
   }
+#pragma unroll
+  for (uint32_t r = 0; r < OWN_ROWS / ROW_STEP; ++r) {
+    const uint32_t row = row_base + r0 + r * ROW_STEP;
+    b128_t raw =
+        stage.base[stage.template get_permuted_offset<KTraits::UPCAST_STRIDE_K_STAGE>(row, c)];
+    alignas(16) DTypeK out[16];
+    vec_cast<DTypeK, DTypeKGmem>::template cast<16>(out, (DTypeKGmem*)&raw);
+    if constexpr (HAS_PREBIAS) {
+      if (prebias_coeff != nullptr) {
+        const float pos = float(kv_idx_base + row);
+#pragma unroll
+        for (uint32_t l = 0; l < 16; ++l) {
+          const float2 cc = *(const float2*)(prebias_coeff + 2 * (c * 16 + l));
+          float sin, cos;
+          __sincosf(pos * freq[l], &sin, &cos);
+          out[l] = DTypeK(float(out[l]) + cc.x * cos + cc.y * sin);
+        }
+      }
+    }
+    k_smem.base[k_smem.template get_permuted_offset<KTraits::UPCAST_STRIDE_K>(row, 2 * c)] =
+        ((b128_t*)out)[0];
+    k_smem.base[k_smem.template get_permuted_offset<KTraits::UPCAST_STRIDE_K>(row, 2 * c + 1)] =
+        ((b128_t*)out)[1];
+  }
+  // Only this warp reads these rows, so a warp-level fence is enough.
+  __syncwarp();
 }
 
 template <typename KTraits>
@@ -2655,13 +2680,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       }
 
       if constexpr (KTraits::K_STAGED) {
-        k_smem_stage_convert<KTraits, has_maybe_prebias_coeff_v<Params>>(
-            &smem_storage, chunk_start + iter * CTA_TILE_KV,
+        const float* prebias_coeff_stage =
             prebias_coeff_base == nullptr
                 ? nullptr
-                : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16,
-            params.rope_rcp_scale, params.rope_rcp_theta, warp_idx, lane_idx);
-        block.sync();
+                : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16;
+        if constexpr (FLASHINFER_PREBIAS_STAGED == 2) {
+          k_smem_stage_convert_warp_local<KTraits, has_maybe_prebias_coeff_v<Params>>(
+              &smem_storage, chunk_start + iter * CTA_TILE_KV, prebias_coeff_stage,
+              params.rope_rcp_scale, params.rope_rcp_theta,
+              get_warp_idx_kv<KTraits>(tid.z), lane_idx);
+        } else {
+          k_smem_stage_convert<KTraits, has_maybe_prebias_coeff_v<Params>>(
+              &smem_storage, chunk_start + iter * CTA_TILE_KV, prebias_coeff_stage,
+              params.rope_rcp_scale, params.rope_rcp_theta, warp_idx, lane_idx);
+          block.sync();
+        }
       }
 
       // compute attention score
@@ -2984,7 +3017,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   constexpr bool K_STAGED =
       FLASHINFER_PREBIAS_STAGED && has_maybe_prebias_coeff_v<Params> && sizeof(DTypeK) == 1;
   using DTypeKSmem = std::conditional_t<K_STAGED, DTypeQ, DTypeKV>;
-  constexpr size_t K_SMEM_BYTES = K_STAGED ? sizeof(DTypeQ) : sizeof(DTypeK);
+  constexpr size_t K_SMEM_BYTES =
+      K_STAGED ? sizeof(DTypeQ) + sizeof(DTypeK) : sizeof(DTypeK);
   // we expect each sm execute two threadblocks
   // FI-2: split K-half and V-half byte sizing.
   const int num_ctas_per_sm =
