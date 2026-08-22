@@ -1267,6 +1267,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         prebias_coeff: Optional[torch.Tensor] = None,
+        prebias_rope_table: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1464,6 +1465,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                                 q.shape[1], q.device
                             ),
                             "maybe_prebias_coeff": lambda: prebias_coeff,
+                            "maybe_prebias_rope_table": lambda: prebias_rope_table,
                         },
                         args,
                     )
@@ -1508,7 +1510,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 ]
 
             self._cached_module.paged_run(
-                *run_args, maybe_prebias_coeff=prebias_coeff
+                *run_args,
+                maybe_prebias_coeff=prebias_coeff,
+                maybe_prebias_rope_table=prebias_rope_table,
             )
         else:
             # trtllm-gen does not need plan info

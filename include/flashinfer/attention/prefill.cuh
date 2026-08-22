@@ -48,7 +48,14 @@ DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 
 namespace cg = cooperative_groups;
 
+// Compile the staged FP8-to-16-bit key expansion.  Measured slower
+// than a 16-bit key cache in both layouts; retained as a control.
+#ifndef FLASHINFER_PREBIAS_STAGED
+#define FLASHINFER_PREBIAS_STAGED 0
+#endif
+
 DEFINE_HAS_MEMBER(maybe_prebias_coeff)
+DEFINE_HAS_MEMBER(maybe_prebias_rope_table)
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
 
@@ -572,6 +579,31 @@ __device__ __forceinline__ void k_smem_stage_convert(
   }
 }
 
+// Table-driven variant of the rotated-bias add.  Reads the model's own
+// rotary cosine/sine table instead of evaluating the rotation, so the
+// key cache stays one byte wide in shared memory and no special
+// function unit work enters the score loop.  The table is the layout
+// the model already keeps: row `t` holds the cosines for every
+// frequency followed by the sines, `table_stride` elements per row.
+template <typename T>
+__device__ __forceinline__ void k_frag_add_rotated_bias_table(
+    T* frag, const float* coeff, const float* rope_table, const uint32_t table_stride,
+    const uint32_t dim_base, const uint32_t kv_offset, const uint32_t lane_idx) {
+  const uint32_t half = table_stride / 2;
+#pragma unroll
+  for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+    const uint32_t i = reg_id / 4, j = (reg_id % 4) / 2;
+    const uint32_t d = dim_base + 8 * j + (lane_idx % 4) * 2 + (reg_id % 2);
+    const size_t row = size_t(kv_offset + 8 * i) * table_stride;
+    // A rotation pairs dimension d with d + half, so both share the
+    // frequency index d % half.
+    const uint32_t f = d % half;
+    const float cos = __ldg(rope_table + row + f);
+    const float sin = __ldg(rope_table + row + half + f);
+    frag[reg_id] = T(float(frag[reg_id]) + coeff[2 * d] * cos + coeff[2 * d + 1] * sin);
+  }
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4], const float rope_rcp_scale,
                                                const float rope_rcp_theta,
@@ -815,6 +847,7 @@ __device__ __forceinline__ void compute_qk(
     smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r,
     typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     const float* prebias_coeff = nullptr, const float (*rope_freq)[4] = nullptr,
+    const float* prebias_rope_table = nullptr, const uint32_t rope_table_stride = 0,
     const uint32_t kv_idx_base = 0, const uint32_t lane_idx = 0) {
   constexpr uint32_t UPCAST_STRIDE_Q = KTraits::UPCAST_STRIDE_Q;
   constexpr uint32_t UPCAST_STRIDE_K = KTraits::UPCAST_STRIDE_K;
@@ -850,10 +883,20 @@ __device__ __forceinline__ void compute_qk(
         if constexpr (HAS_PREBIAS) {
           // a prebias-capable module may still serve biasless layers
           if (prebias_coeff != nullptr) {
-            k_frag_add_rotated_bias<typename KTraits::DTypeQ>(
-                (typename KTraits::DTypeQ*)b_frag, prebias_coeff,
-                rope_freq[mma_d % (KTraits::NUM_MMA_D_QK / 2)], mma_d * 16,
-                kv_idx_base + mma_kv * 16 + lane_idx / 4, lane_idx);
+            // The branch is warp-uniform: one module serves both the
+            // table path and the trigonometric path it replaces, so
+            // they can be compared inside a single process.
+            if (prebias_rope_table != nullptr) {
+              k_frag_add_rotated_bias_table<typename KTraits::DTypeQ>(
+                  (typename KTraits::DTypeQ*)b_frag, prebias_coeff, prebias_rope_table,
+                  rope_table_stride, mma_d * 16,
+                  kv_idx_base + mma_kv * 16 + lane_idx / 4, lane_idx);
+            } else {
+              k_frag_add_rotated_bias<typename KTraits::DTypeQ>(
+                  (typename KTraits::DTypeQ*)b_frag, prebias_coeff,
+                  rope_freq[mma_d % (KTraits::NUM_MMA_D_QK / 2)], mma_d * 16,
+                  kv_idx_base + mma_kv * 16 + lane_idx / 4, lane_idx);
+            }
           }
         }
       } else {
@@ -2064,8 +2107,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
     const float* prebias_coeff_base = nullptr;
+    const float* prebias_rope_table = nullptr;
     if constexpr (has_maybe_prebias_coeff_v<Params>) {
       prebias_coeff_base = params.maybe_prebias_coeff;
+    }
+    if constexpr (has_maybe_prebias_rope_table_v<Params>) {
+      prebias_rope_table = params.maybe_prebias_rope_table;
     }
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
@@ -2206,7 +2253,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
               : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16;
       compute_qk<KTraits, has_maybe_prebias_coeff_v<Params>>(
           &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, prebias_coeff_head,
-          rope_freq, kv_idx_base, lane_idx);
+          rope_freq, prebias_rope_table, KTraits::NUM_MMA_D_QK * 16, kv_idx_base, lane_idx);
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
@@ -2399,8 +2446,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     float rope_freq[NUM_MMA_D_QK / 2][4];
 
     const float* prebias_coeff_base = nullptr;
+    const float* prebias_rope_table = nullptr;
     if constexpr (has_maybe_prebias_coeff_v<Params>) {
       prebias_coeff_base = params.maybe_prebias_coeff;
+    }
+    if constexpr (has_maybe_prebias_rope_table_v<Params>) {
+      prebias_rope_table = params.maybe_prebias_rope_table;
     }
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
@@ -2622,7 +2673,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16;
       compute_qk<KTraits, has_maybe_prebias_coeff_v<Params> && !KTraits::K_STAGED>(
           &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, prebias_coeff_head,
-          rope_freq, kv_idx_base, lane_idx);
+          rope_freq, prebias_rope_table, KTraits::NUM_MMA_D_QK * 16, kv_idx_base, lane_idx);
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                 kv_idx_base, qo_len, kv_len, group_size, s_frag, tid, kv_head_idx);
 
@@ -2927,7 +2978,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // memory.  The consumer-side traits then see a 16-bit K dtype (the
   // proven 16-bit QK schedule) while the producer reads the one-byte
   // cache; shared memory pays sizeof(DTypeQ) + 1 bytes per K element.
-  constexpr bool K_STAGED = has_maybe_prebias_coeff_v<Params> && sizeof(DTypeK) == 1;
+  // The staged expansion path measured slower than a 16-bit key cache
+  // in both of its layouts.  It stays in tree as the control for that
+  // result and is compiled only when explicitly asked for.
+  constexpr bool K_STAGED =
+      FLASHINFER_PREBIAS_STAGED && has_maybe_prebias_coeff_v<Params> && sizeof(DTypeK) == 1;
   using DTypeKSmem = std::conditional_t<K_STAGED, DTypeQ, DTypeKV>;
   constexpr size_t K_SMEM_BYTES = K_STAGED ? sizeof(DTypeQ) : sizeof(DTypeK);
   // we expect each sm execute two threadblocks

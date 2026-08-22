@@ -1060,6 +1060,8 @@ def gen_batch_prefill_module(
         if use_prebias:
             additional_tensor_names.append("maybe_prebias_coeff")
             additional_tensor_dtypes.append("float")
+            additional_tensor_names.append("maybe_prebias_rope_table")
+            additional_tensor_dtypes.append("float")
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
