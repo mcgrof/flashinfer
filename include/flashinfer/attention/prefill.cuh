@@ -84,6 +84,8 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 // 5  the complete correction: basis per tile and matmul per tile
 // 6  the same correction with the basis operand built in registers, so
 //    no basis tile is stored or read back at all
+// 7  as 6, but pairing the two halves of the head dimension, which share
+//    a frequency, so one sine and cosine serves two steps
 //
 // Levels 2 to 4 are diagnostics that separate the cost components; only
 // level 5 is a deployable kernel.  Level 4 keeps the shared-memory layout
@@ -918,6 +920,82 @@ __device__ __forceinline__ void compute_score_correction_direct(
     }
   }
   *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+}
+
+// As the register-direct correction, but pairing the halves.
+//
+// Dimension d and dimension d + D/2 carry the same rotary frequency, and
+// the basis holds the cosine of one and the sine of the other. The steps
+// of the score matmul are laid out so that step m and step m + M/2 cover
+// exactly such a pair, which means one sine and cosine serves both and the
+// direct version was computing each of them twice.
+//
+// Pairing them halves the transcendental and rotation work for the same
+// phase state, at the cost of holding a second query fragment and a second
+// operand fragment.
+template <typename KTraits>
+__device__ __forceinline__ void compute_score_correction_paired(
+    typename KTraits::SharedStorage* smem_storage, const uint32_t qt_row_base,
+    const uint32_t qt_col_base, const uint32_t kv_idx_base, const float rope_rcp_scale,
+    const float rope_rcp_theta, const uint32_t lane_idx,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t STRIDE = KTraits::UPCAST_STRIDE_Q;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t HALF = HEAD_DIM / 2;
+  constexpr uint32_t NM_HALF = KTraits::NUM_MMA_D_QK / 2;
+  smem_t<KTraits::SWIZZLE_MODE_Q> qt(smem_storage->qt_smem);
+  uint32_t a_lo[KTraits::NUM_MMA_Q][4], a_hi[KTraits::NUM_MMA_Q][4];
+  uint32_t b_lo[4], b_hi[4];
+
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < NM_HALF; ++mma_d) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      qt.ldmatrix_m8n8x4(
+          qt.template get_permuted_offset<STRIDE>(qt_row_base + mma_q * 16,
+                                                  qt_col_base + 2 * mma_d),
+          a_lo[mma_q]);
+      qt.ldmatrix_m8n8x4(
+          qt.template get_permuted_offset<STRIDE>(qt_row_base + mma_q * 16,
+                                                  qt_col_base + 2 * (mma_d + NM_HALF)),
+          a_hi[mma_q]);
+    }
+
+    float pc[4], ps[4], rc[4], rs[4];
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      const uint32_t d = mma_d * 16 + 8 * (j / 2) + (lane_idx % 4) * 2 + (j % 2);
+      const float f = rope_rcp_scale * __powf(rope_rcp_theta, float(2 * d) / float(HEAD_DIM));
+      __sincosf(float(kv_idx_base + lane_idx / 4) * f, &ps[j], &pc[j]);
+      __sincosf(8.0f * f, &rs[j], &rc[j]);
+    }
+
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+      DTypeQ* bl = (DTypeQ*)b_lo;
+      DTypeQ* bh = (DTypeQ*)b_hi;
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        const float c0 = pc[j], s0 = ps[j];
+        const float c1 = c0 * rc[j] - s0 * rs[j];
+        const float s1 = s0 * rc[j] + c0 * rs[j];
+        bl[j] = DTypeQ(c0);      // the lower half takes the cosine
+        bl[4 + j] = DTypeQ(c1);
+        bh[j] = DTypeQ(s0);      // the upper half takes the sine
+        bh[4 + j] = DTypeQ(s1);
+        pc[j] = c1 * rc[j] - s1 * rs[j];
+        ps[j] = s1 * rc[j] + c1 * rs[j];
+      }
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInplaceUpdate>(
+            s_frag[mma_q][mma_kv], a_lo[mma_q], b_lo);
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInplaceUpdate>(
+            s_frag[mma_q][mma_kv], a_hi[mma_q], b_hi);
+      }
+    }
+  }
 }
 
 template <typename KTraits>
@@ -3043,6 +3121,12 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             compute_score_correction_direct<KTraits>(
                 &smem_storage, &qt_smem_offset_r, kv_idx_base, params.rope_rcp_scale,
                 params.rope_rcp_theta, lane_idx, s_frag);
+          } else if constexpr (KTraits::SCORE_LEVEL == 7) {
+            compute_score_correction_paired<KTraits>(
+                &smem_storage,
+                get_warp_idx_q<KTraits>(tid.y) * KTraits::NUM_MMA_Q * 16 + lane_idx % 16,
+                lane_idx / 16, kv_idx_base, params.rope_rcp_scale, params.rope_rcp_theta,
+                lane_idx, s_frag);
           }
         }
       }
