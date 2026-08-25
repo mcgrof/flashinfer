@@ -877,9 +877,14 @@ __device__ __forceinline__ void compute_score_correction_direct(
     *qt_smem_offset_r = qt.template advance_offset_by_column<2>(*qt_smem_offset_r, mma_d) -
                         KTraits::NUM_MMA_Q * 16 * STRIDE;
 
+    // Every dimension a lane owns for one mma_d lies in a single half of
+    // the head dimension, because the four slots span sixteen contiguous
+    // dimensions and the halves are a multiple of sixteen apart. So the
+    // cosine-or-sine choice is one value for the whole step, not one per
+    // slot, and the compiler can fold it after unrolling.
+    const bool take_sin = (mma_d * 16) >= HALF;
     // one phase and one rotor per dimension this lane owns
     float pc[4], ps[4], rc[4], rs[4];
-    bool take_sin[4];
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
       const uint32_t d = mma_d * 16 + 8 * (j / 2) + (lane_idx % 4) * 2 + (j % 2);
@@ -888,7 +893,6 @@ __device__ __forceinline__ void compute_score_correction_direct(
           rope_rcp_scale * __powf(rope_rcp_theta, float(2 * fi) / float(HEAD_DIM));
       __sincosf(float(kv_idx_base + lane_idx / 4) * f, &ps[j], &pc[j]);
       __sincosf(8.0f * f, &rs[j], &rc[j]);
-      take_sin[j] = (d >= HALF);
     }
 
 #pragma unroll
@@ -900,8 +904,8 @@ __device__ __forceinline__ void compute_score_correction_direct(
         // the second row of the fragment is eight positions further on
         const float c1 = c0 * rc[j] - s0 * rs[j];
         const float s1 = s0 * rc[j] + c0 * rs[j];
-        b[j] = DTypeQ(take_sin[j] ? s0 : c0);
-        b[4 + j] = DTypeQ(take_sin[j] ? s1 : c1);
+        b[j] = DTypeQ(take_sin ? s0 : c0);
+        b[4 + j] = DTypeQ(take_sin ? s1 : c1);
         // and the next fragment is sixteen further on, so rotate again
         pc[j] = c1 * rc[j] - s1 * rs[j];
         ps[j] = s1 * rc[j] + c1 * rs[j];
