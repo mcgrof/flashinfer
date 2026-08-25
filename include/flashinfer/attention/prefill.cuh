@@ -82,6 +82,8 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 // 3  also generate and store the basis, still no correction matmul
 // 4  prefill the basis once, then run the correction matmul per tile
 // 5  the complete correction: basis per tile and matmul per tile
+// 6  the same correction with the basis operand built in registers, so
+//    no basis tile is stored or read back at all
 //
 // Levels 2 to 4 are diagnostics that separate the cost components; only
 // level 5 is a deployable kernel.  Level 4 keeps the shared-memory layout
@@ -133,7 +135,8 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename DTypeK = DTypeKV, typename DTypeV = DTypeKV, bool K_STAGED = false,
-          typename DTypeKGmem = DTypeK, bool SCORE_CORR = false>
+          typename DTypeKGmem = DTypeK, bool SCORE_CORR = false,
+          bool NEEDS_PSI = SCORE_CORR>
 struct SharedStorageQKVO {
   union {
     struct {
@@ -150,7 +153,7 @@ struct SharedStorageQKVO {
       // positions.  Both collapse to one slot when not compiled in.
       alignas(16) std::conditional_t<SCORE_CORR, DTypeQ[CTA_TILE_Q * HEAD_DIM_QK],
                                      DTypeQ[8]> qt_smem;
-      alignas(16) std::conditional_t<SCORE_CORR, DTypeQ[CTA_TILE_KV * HEAD_DIM_QK],
+      alignas(16) std::conditional_t<NEEDS_PSI, DTypeQ[CTA_TILE_KV * HEAD_DIM_QK],
                                      DTypeQ[8]> psi_smem;
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
@@ -179,6 +182,9 @@ struct KernelTraits {
   // Score-domain bias correction compiled in, and which of its parts.
   static constexpr bool SCORE_CORR = SCORE_CORR_;
   static constexpr int SCORE_LEVEL = SCORE_CORR_ ? FLASHINFER_PREBIAS_SCORE : 0;
+  // Levels 3 to 5 stage the basis in shared memory; level 6 builds the
+  // operand in registers and needs no tile at all.
+  static constexpr bool NEEDS_PSI = SCORE_LEVEL >= 3 && SCORE_LEVEL <= 5;
   // Staged pre-bias K: the global-memory K cache is one byte wide
   // (DTypeKGmem_) while the shared-memory tile and the QK loop use the
   // 16-bit DTypeKV_.  A producer stages the one-byte tile and a
@@ -246,7 +252,8 @@ struct KernelTraits {
   // dtype.  Today both equal DTypeKV; FI-3 will let them diverge.
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
                                           HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
-                                          DTypeK, DTypeV, K_STAGED_, DTypeKGmem_, SCORE_CORR_>;
+                                          DTypeK, DTypeV, K_STAGED_, DTypeKGmem_, SCORE_CORR_,
+                                          NEEDS_PSI>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
@@ -829,6 +836,84 @@ __device__ __forceinline__ void compute_score_correction(
   // from the top, the same contract compute_qk keeps.
   *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
   *psi_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+}
+
+// Build the correction's second operand directly in registers, so the
+// cosine and sine tile is never written to shared memory nor read back.
+//
+// The operand layout is the one the key side already uses and which the
+// per-element bias helper validated on hardware: within a fragment,
+// element `reg` holds
+//
+//     row = kv_idx_base + mma_kv*16 + lane/4 + 8*(reg/4)
+//     dim = mma_d*16 + 8*((reg%4)/2) + (lane%4)*2 + (reg%2)
+//
+// so a lane sees four distinct dimensions and two rows eight apart, and
+// consecutive `mma_kv` steps advance the row by sixteen. That makes the
+// whole fragment sequence a rotation: evaluate one transcendental per
+// dimension, then step. Rotating by eight twice gives the sixteen-step
+// advance, so only the eight-step rotor is carried and the register
+// state stays at four dimensions times two values, plus the rotor.
+template <typename KTraits>
+__device__ __forceinline__ void compute_score_correction_direct(
+    typename KTraits::SharedStorage* smem_storage, uint32_t* qt_smem_offset_r,
+    const uint32_t kv_idx_base, const float rope_rcp_scale, const float rope_rcp_theta,
+    const uint32_t lane_idx,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t STRIDE = KTraits::UPCAST_STRIDE_Q;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t HALF = HEAD_DIM / 2;
+  smem_t<KTraits::SWIZZLE_MODE_Q> qt(smem_storage->qt_smem);
+  uint32_t a_frag[KTraits::NUM_MMA_Q][4], b_frag[4];
+
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK; ++mma_d) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      qt.ldmatrix_m8n8x4(*qt_smem_offset_r, a_frag[mma_q]);
+      *qt_smem_offset_r = qt.template advance_offset_by_row<16, STRIDE>(*qt_smem_offset_r);
+    }
+    *qt_smem_offset_r = qt.template advance_offset_by_column<2>(*qt_smem_offset_r, mma_d) -
+                        KTraits::NUM_MMA_Q * 16 * STRIDE;
+
+    // one phase and one rotor per dimension this lane owns
+    float pc[4], ps[4], rc[4], rs[4];
+    bool take_sin[4];
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      const uint32_t d = mma_d * 16 + 8 * (j / 2) + (lane_idx % 4) * 2 + (j % 2);
+      const uint32_t fi = d % HALF;
+      const float f =
+          rope_rcp_scale * __powf(rope_rcp_theta, float(2 * fi) / float(HEAD_DIM));
+      __sincosf(float(kv_idx_base + lane_idx / 4) * f, &ps[j], &pc[j]);
+      __sincosf(8.0f * f, &rs[j], &rc[j]);
+      take_sin[j] = (d >= HALF);
+    }
+
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+      DTypeQ* b = (DTypeQ*)b_frag;
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        const float c0 = pc[j], s0 = ps[j];
+        // the second row of the fragment is eight positions further on
+        const float c1 = c0 * rc[j] - s0 * rs[j];
+        const float s1 = s0 * rc[j] + c0 * rs[j];
+        b[j] = DTypeQ(take_sin[j] ? s0 : c0);
+        b[4 + j] = DTypeQ(take_sin[j] ? s1 : c1);
+        // and the next fragment is sixteen further on, so rotate again
+        pc[j] = c1 * rc[j] - s1 * rs[j];
+        ps[j] = s1 * rc[j] + c1 * rs[j];
+      }
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInplaceUpdate>(
+            s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+      }
+    }
+  }
+  *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
 }
 
 template <typename KTraits>
@@ -2947,9 +3032,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 &smem_storage, chunk_start + iter * CTA_TILE_KV, params.rope_rcp_scale,
                 params.rope_rcp_theta, get_warp_idx_kv<KTraits>(tid.z), lane_idx);
           }
-          if constexpr (KTraits::SCORE_LEVEL >= 4) {
+          if constexpr (KTraits::SCORE_LEVEL == 4 || KTraits::SCORE_LEVEL == 5) {
             compute_score_correction<KTraits>(&smem_storage, &qt_smem_offset_r, &psi_smem_offset_r,
                                               s_frag);
+          } else if constexpr (KTraits::SCORE_LEVEL == 6) {
+            compute_score_correction_direct<KTraits>(
+                &smem_storage, &qt_smem_offset_r, kv_idx_base, params.rope_rcp_scale,
+                params.rope_rcp_theta, lane_idx, s_frag);
           }
         }
       }
@@ -3266,10 +3355,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // instead holds a 16-bit basis tile for the tile's positions.
   constexpr bool SCORE_CORR =
       (FLASHINFER_PREBIAS_SCORE >= 2) && has_maybe_prebias_coeff_v<Params>;
+  // Only the levels that stage a basis tile pay for one.
+  constexpr bool NEEDS_PSI =
+      SCORE_CORR && FLASHINFER_PREBIAS_SCORE >= 3 && FLASHINFER_PREBIAS_SCORE <= 5;
   using DTypeKSmem = std::conditional_t<K_STAGED, DTypeQ, DTypeKV>;
   constexpr size_t K_SMEM_BYTES = (K_STAGED ? sizeof(DTypeQ) + sizeof(DTypeK)
                                             : sizeof(DTypeK)) +
-                                  (SCORE_CORR ? sizeof(DTypeQ) : 0);
+                                  (NEEDS_PSI ? sizeof(DTypeQ) : 0);
   // we expect each sm execute two threadblocks
   // FI-2: split K-half and V-half byte sizing.
   const int num_ctas_per_sm =
