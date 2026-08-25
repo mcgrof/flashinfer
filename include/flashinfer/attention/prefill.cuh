@@ -90,6 +90,10 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 //    table so they are computed once per block rather than once per tile
 // 9  as 8, additionally pairing the two halves, so the one sine and
 //    cosine still evaluated per tile serves two steps
+// The lane map is checked from the host instead of by a debug kernel: with
+// the residual keys zeroed the scores are exactly q . RoPE_t(b_K), so the
+// output isolates the correction and any mis-mapped position or head half
+// shows up directly. See scripts/prebias_lane_map_oracle.py.
 //
 // Levels 2 to 4 are diagnostics that separate the cost components; only
 // level 5 is a deployable kernel.  Level 4 keeps the shared-memory layout
@@ -142,7 +146,7 @@ template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename DTypeK = DTypeKV, typename DTypeV = DTypeKV, bool K_STAGED = false,
           typename DTypeKGmem = DTypeK, bool SCORE_CORR = false,
-          bool NEEDS_PSI = SCORE_CORR>
+          bool NEEDS_PSI = SCORE_CORR, bool NEEDS_ROPE_TAB = SCORE_CORR>
 struct SharedStorageQKVO {
   union {
     struct {
@@ -164,7 +168,7 @@ struct SharedStorageQKVO {
       // Frequency and eight-step rotor per rotary frequency index. These
       // do not depend on the tile, so they are built once per block. Three
       // floats per index, under a kilobyte at any head dimension in use.
-      alignas(16) std::conditional_t<SCORE_CORR, float[3 * (HEAD_DIM_QK / 2)],
+      alignas(16) std::conditional_t<NEEDS_ROPE_TAB, float[3 * (HEAD_DIM_QK / 2)],
                                      float[4]> rope_tab;
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
@@ -196,6 +200,8 @@ struct KernelTraits {
   // Levels 3 to 5 stage the basis in shared memory; level 6 builds the
   // operand in registers and needs no tile at all.
   static constexpr bool NEEDS_PSI = SCORE_LEVEL >= 3 && SCORE_LEVEL <= 5;
+  // Only the table-backed levels read the rotary table.
+  static constexpr bool NEEDS_ROPE_TAB = SCORE_LEVEL == 8 || SCORE_LEVEL == 9;
   // Staged pre-bias K: the global-memory K cache is one byte wide
   // (DTypeKGmem_) while the shared-memory tile and the QK loop use the
   // 16-bit DTypeKV_.  A producer stages the one-byte tile and a
@@ -264,7 +270,7 @@ struct KernelTraits {
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
                                           HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO,
                                           DTypeK, DTypeV, K_STAGED_, DTypeKGmem_, SCORE_CORR_,
-                                          NEEDS_PSI>;
+                                          NEEDS_PSI, NEEDS_ROPE_TAB>;
 #ifdef FP16_QK_REDUCTION_SUPPORTED
   template <typename DT>
   static constexpr DT getNegInf() {
