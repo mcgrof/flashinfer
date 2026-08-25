@@ -1062,6 +1062,10 @@ def gen_batch_prefill_module(
             additional_tensor_dtypes.append("float")
             additional_tensor_names.append("maybe_prebias_rope_table")
             additional_tensor_dtypes.append("float")
+            # per-request logical start position; float keeps the existing
+            # plumbing and is exact for any position below 2^24
+            additional_tensor_names.append("maybe_prebias_pos_base")
+            additional_tensor_dtypes.append("float")
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",

@@ -112,6 +112,7 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 
 DEFINE_HAS_MEMBER(maybe_prebias_coeff)
 DEFINE_HAS_MEMBER(maybe_prebias_rope_table)
+DEFINE_HAS_MEMBER(maybe_prebias_pos_base)
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
 
@@ -3281,9 +3282,23 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // They differ whenever a request starts partway through a sequence,
       // as under prefix reuse, so the correction must use the same base the
       // rotary path uses.
-      const uint32_t prebias_pos_base =
-          kv_idx_base +
-          (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]);
+      // The bias was rotated at the key's LOGICAL position, which is the
+      // rotary position rather than the offset into this request's cache.
+      // They differ whenever a request starts partway through a sequence,
+      // as under prefix reuse.  The base comes from an explicit per-request
+      // tensor when one is bound, and otherwise from the rotary field, so a
+      // caller that supplies neither still gets the ordinary layout where
+      // the two coincide.
+      uint32_t prebias_pos_base = kv_idx_base;
+      if constexpr (has_maybe_prebias_pos_base_v<Params>) {
+        if (params.maybe_prebias_pos_base != nullptr) {
+          prebias_pos_base += (uint32_t)params.maybe_prebias_pos_base[request_idx];
+        } else if (paged_kv.rope_pos_offset != nullptr) {
+          prebias_pos_base += paged_kv.rope_pos_offset[request_idx];
+        }
+      } else if (paged_kv.rope_pos_offset != nullptr) {
+        prebias_pos_base += paged_kv.rope_pos_offset[request_idx];
+      }
       compute_qk<KTraits, has_maybe_prebias_coeff_v<Params> && !KTraits::K_STAGED &&
                        !KTraits::SCORE_CORR>(
           &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, prebias_coeff_head,

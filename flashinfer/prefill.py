@@ -503,6 +503,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None, use_pre
         scale_v: Optional[torch.Tensor] = None,
         maybe_prebias_coeff: Optional[torch.Tensor] = None,
         maybe_prebias_rope_table: Optional[torch.Tensor] = None,
+        maybe_prebias_pos_base: Optional[torch.Tensor] = None,
     ) -> None:
         # Check if FP8 by presence of scale tensors
         is_fp8 = scale_q is not None
@@ -530,7 +531,11 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None, use_pre
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
                 *(
-                    (maybe_prebias_coeff, maybe_prebias_rope_table)
+                    (
+                        maybe_prebias_coeff,
+                        maybe_prebias_rope_table,
+                        maybe_prebias_pos_base,
+                    )
                     if use_prebias
                     else ()
                 ),
@@ -628,6 +633,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None, use_pre
         token_pos_in_items_len: int,
         maybe_prebias_coeff: Optional[torch.Tensor] = None,
         maybe_prebias_rope_table: Optional[torch.Tensor] = None,
+        maybe_prebias_pos_base: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -693,6 +699,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None, use_pre
         uses_shared_paged_kv_idx: bool = True,
         maybe_prebias_coeff: Optional[torch.Tensor] = None,
         maybe_prebias_rope_table: Optional[torch.Tensor] = None,
+        maybe_prebias_pos_base: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
             assert maybe_lse is None
@@ -757,7 +764,11 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None, use_pre
                 maybe_token_pos_in_items_ptr,
                 maybe_max_item_len_ptr,
                 *(
-                    (maybe_prebias_coeff, maybe_prebias_rope_table)
+                    (
+                        maybe_prebias_coeff,
+                        maybe_prebias_rope_table,
+                        maybe_prebias_pos_base,
+                    )
                     if use_prebias
                     else ()
                 ),
@@ -876,6 +887,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None, use_pre
         uses_shared_paged_kv_idx: bool = True,
         maybe_prebias_coeff: Optional[torch.Tensor] = None,
         maybe_prebias_rope_table: Optional[torch.Tensor] = None,
+        maybe_prebias_pos_base: Optional[torch.Tensor] = None,
     ) -> None:
         pass
 
@@ -2210,6 +2222,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         prebias_coeff: Optional[torch.Tensor] = None,
         prebias_rope_table: Optional[torch.Tensor] = None,
+        prebias_pos_base: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2525,6 +2538,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 *run_args,
                 maybe_prebias_coeff=prebias_coeff,
                 maybe_prebias_rope_table=prebias_rope_table,
+                maybe_prebias_pos_base=prebias_pos_base,
             )
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
