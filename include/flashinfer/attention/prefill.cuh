@@ -88,6 +88,8 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 //    a frequency, so one sine and cosine serves two steps
 // 8  as 6, with the tile-invariant frequencies and rotors held in a small
 //    table so they are computed once per block rather than once per tile
+// 9  as 8, additionally pairing the two halves, so the one sine and
+//    cosine still evaluated per tile serves two steps
 //
 // Levels 2 to 4 are diagnostics that separate the cost components; only
 // level 5 is a deployable kernel.  Level 4 keeps the shared-memory layout
@@ -1085,6 +1087,77 @@ __device__ __forceinline__ void compute_score_correction_tabbed(
     }
   }
   *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+}
+
+// The table-backed correction, additionally pairing the halves.
+//
+// With the frequency and rotor read from the per-block table, the only
+// work still done per tile is the initial phase. Pairing the steps that
+// share a frequency halves that too. The earlier attempt at pairing lost
+// because it also had to duplicate the power and rotor evaluation; with
+// those gone, only the second query and operand fragment remain as cost.
+template <typename KTraits>
+__device__ __forceinline__ void compute_score_correction_tabbed_paired(
+    typename KTraits::SharedStorage* smem_storage, const uint32_t qt_row_base,
+    const uint32_t qt_col_base, const uint32_t kv_idx_base, const uint32_t lane_idx,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t STRIDE = KTraits::UPCAST_STRIDE_Q;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t NM_HALF = KTraits::NUM_MMA_D_QK / 2;
+  smem_t<KTraits::SWIZZLE_MODE_Q> qt(smem_storage->qt_smem);
+  const float* tab = smem_storage->rope_tab;
+  uint32_t a_lo[KTraits::NUM_MMA_Q][4], a_hi[KTraits::NUM_MMA_Q][4];
+  uint32_t b_lo[4], b_hi[4];
+
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < NM_HALF; ++mma_d) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      qt.ldmatrix_m8n8x4(qt.template get_permuted_offset<STRIDE>(qt_row_base + mma_q * 16,
+                                                                 qt_col_base + 2 * mma_d),
+                         a_lo[mma_q]);
+      qt.ldmatrix_m8n8x4(
+          qt.template get_permuted_offset<STRIDE>(qt_row_base + mma_q * 16,
+                                                  qt_col_base + 2 * (mma_d + NM_HALF)),
+          a_hi[mma_q]);
+    }
+
+    float pc[4], ps[4], rc[4], rs[4];
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      const uint32_t fi = mma_d * 16 + 8 * (j / 2) + (lane_idx % 4) * 2 + (j % 2);
+      const float f = tab[3 * fi + 0];
+      rc[j] = tab[3 * fi + 1];
+      rs[j] = tab[3 * fi + 2];
+      __sincosf(float(kv_idx_base + lane_idx / 4) * f, &ps[j], &pc[j]);
+    }
+
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+      DTypeQ* bl = (DTypeQ*)b_lo;
+      DTypeQ* bh = (DTypeQ*)b_hi;
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        const float c0 = pc[j], s0 = ps[j];
+        const float c1 = c0 * rc[j] - s0 * rs[j];
+        const float s1 = s0 * rc[j] + c0 * rs[j];
+        bl[j] = DTypeQ(c0);
+        bl[4 + j] = DTypeQ(c1);
+        bh[j] = DTypeQ(s0);
+        bh[4 + j] = DTypeQ(s1);
+        pc[j] = c1 * rc[j] - s1 * rs[j];
+        ps[j] = s1 * rc[j] + c1 * rs[j];
+      }
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInplaceUpdate>(
+            s_frag[mma_q][mma_kv], a_lo[mma_q], b_lo);
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInplaceUpdate>(
+            s_frag[mma_q][mma_kv], a_hi[mma_q], b_hi);
+      }
+    }
+  }
 }
 
 template <typename KTraits>
@@ -2995,7 +3068,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             &qo_smem, &smem_storage,
             prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16,
             (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
-        if constexpr (KTraits::SCORE_LEVEL == 8) {
+        if constexpr (KTraits::SCORE_LEVEL == 8 || KTraits::SCORE_LEVEL == 9) {
           build_rope_table<KTraits>(&smem_storage, params.rope_rcp_scale,
                                     params.rope_rcp_theta,
                                     (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
@@ -3215,6 +3288,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             compute_score_correction_direct<KTraits>(
                 &smem_storage, &qt_smem_offset_r, kv_idx_base, params.rope_rcp_scale,
                 params.rope_rcp_theta, lane_idx, s_frag);
+          } else if constexpr (KTraits::SCORE_LEVEL == 9) {
+            compute_score_correction_tabbed_paired<KTraits>(
+                &smem_storage,
+                get_warp_idx_q<KTraits>(tid.y) * KTraits::NUM_MMA_Q * 16 + lane_idx % 16,
+                lane_idx / 16, kv_idx_base, lane_idx, s_frag);
           } else if constexpr (KTraits::SCORE_LEVEL == 8) {
             compute_score_correction_tabbed<KTraits>(&smem_storage, &qt_smem_offset_r,
                                                      kv_idx_base, lane_idx, s_frag);
