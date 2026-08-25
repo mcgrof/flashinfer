@@ -86,6 +86,8 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 //    no basis tile is stored or read back at all
 // 7  as 6, but pairing the two halves of the head dimension, which share
 //    a frequency, so one sine and cosine serves two steps
+// 8  as 6, with the tile-invariant frequencies and rotors held in a small
+//    table so they are computed once per block rather than once per tile
 //
 // Levels 2 to 4 are diagnostics that separate the cost components; only
 // level 5 is a deployable kernel.  Level 4 keeps the shared-memory layout
@@ -157,6 +159,11 @@ struct SharedStorageQKVO {
                                      DTypeQ[8]> qt_smem;
       alignas(16) std::conditional_t<NEEDS_PSI, DTypeQ[CTA_TILE_KV * HEAD_DIM_QK],
                                      DTypeQ[8]> psi_smem;
+      // Frequency and eight-step rotor per rotary frequency index. These
+      // do not depend on the tile, so they are built once per block. Three
+      // floats per index, under a kilobyte at any head dimension in use.
+      alignas(16) std::conditional_t<SCORE_CORR, float[3 * (HEAD_DIM_QK / 2)],
+                                     float[4]> rope_tab;
     };
     struct {  // NOTE(Zihao): synchronize attention states across warps
       alignas(
@@ -996,6 +1003,88 @@ __device__ __forceinline__ void compute_score_correction_paired(
       }
     }
   }
+}
+
+// Fill the per-block table of rotary frequencies and their eight-step
+// rotors. Neither depends on the key tile, so paying for them once per
+// block removes a power and a sine-cosine per dimension per tile from the
+// correction's inner work.
+template <typename KTraits>
+__device__ __forceinline__ void build_rope_table(typename KTraits::SharedStorage* smem_storage,
+                                                 const float rope_rcp_scale,
+                                                 const float rope_rcp_theta,
+                                                 const uint32_t tidx) {
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t HALF = HEAD_DIM / 2;
+  float* tab = smem_storage->rope_tab;
+  for (uint32_t fi = tidx; fi < HALF; fi += KTraits::NUM_THREADS) {
+    const float f = rope_rcp_scale * __powf(rope_rcp_theta, float(2 * fi) / float(HEAD_DIM));
+    float rs, rc;
+    __sincosf(8.0f * f, &rs, &rc);
+    tab[3 * fi + 0] = f;
+    tab[3 * fi + 1] = rc;
+    tab[3 * fi + 2] = rs;
+  }
+}
+
+// The register-direct correction, reading the tile-invariant frequency and
+// rotor from the per-block table instead of recomputing them.
+template <typename KTraits>
+__device__ __forceinline__ void compute_score_correction_tabbed(
+    typename KTraits::SharedStorage* smem_storage, uint32_t* qt_smem_offset_r,
+    const uint32_t kv_idx_base, const uint32_t lane_idx,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8]) {
+  using DTypeQ = typename KTraits::DTypeQ;
+  constexpr uint32_t STRIDE = KTraits::UPCAST_STRIDE_Q;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t HALF = HEAD_DIM / 2;
+  smem_t<KTraits::SWIZZLE_MODE_Q> qt(smem_storage->qt_smem);
+  const float* tab = smem_storage->rope_tab;
+  uint32_t a_frag[KTraits::NUM_MMA_Q][4], b_frag[4];
+
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK; ++mma_d) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      qt.ldmatrix_m8n8x4(*qt_smem_offset_r, a_frag[mma_q]);
+      *qt_smem_offset_r = qt.template advance_offset_by_row<16, STRIDE>(*qt_smem_offset_r);
+    }
+    *qt_smem_offset_r = qt.template advance_offset_by_column<2>(*qt_smem_offset_r, mma_d) -
+                        KTraits::NUM_MMA_Q * 16 * STRIDE;
+
+    const bool take_sin = (mma_d * 16) >= HALF;
+    float pc[4], ps[4], rc[4], rs[4];
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      const uint32_t d = mma_d * 16 + 8 * (j / 2) + (lane_idx % 4) * 2 + (j % 2);
+      const uint32_t fi = d % HALF;
+      const float f = tab[3 * fi + 0];
+      rc[j] = tab[3 * fi + 1];
+      rs[j] = tab[3 * fi + 2];
+      __sincosf(float(kv_idx_base + lane_idx / 4) * f, &ps[j], &pc[j]);
+    }
+
+#pragma unroll
+    for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+      DTypeQ* b = (DTypeQ*)b_frag;
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        const float c0 = pc[j], s0 = ps[j];
+        const float c1 = c0 * rc[j] - s0 * rs[j];
+        const float s1 = s0 * rc[j] + c0 * rs[j];
+        b[j] = DTypeQ(take_sin ? s0 : c0);
+        b[4 + j] = DTypeQ(take_sin ? s1 : c1);
+        pc[j] = c1 * rc[j] - s1 * rs[j];
+        ps[j] = s1 * rc[j] + c1 * rs[j];
+      }
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+        mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInplaceUpdate>(
+            s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+      }
+    }
+  }
+  *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
 }
 
 template <typename KTraits>
@@ -2906,6 +2995,11 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             &qo_smem, &smem_storage,
             prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16,
             (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
+        if constexpr (KTraits::SCORE_LEVEL == 8) {
+          build_rope_table<KTraits>(&smem_storage, params.rope_rcp_scale,
+                                    params.rope_rcp_theta,
+                                    (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
+        }
         if constexpr (KTraits::SCORE_LEVEL == 4) {
           // Diagnostic: fill the basis once with valid values so the tile
           // loop measures the matmul and its shared-memory reads without
@@ -3121,6 +3215,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             compute_score_correction_direct<KTraits>(
                 &smem_storage, &qt_smem_offset_r, kv_idx_base, params.rope_rcp_scale,
                 params.rope_rcp_theta, lane_idx, s_frag);
+          } else if constexpr (KTraits::SCORE_LEVEL == 8) {
+            compute_score_correction_tabbed<KTraits>(&smem_storage, &qt_smem_offset_r,
+                                                     kv_idx_base, lane_idx, s_frag);
           } else if constexpr (KTraits::SCORE_LEVEL == 7) {
             compute_score_correction_paired<KTraits>(
                 &smem_storage,
