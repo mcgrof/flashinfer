@@ -3276,6 +3276,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           prebias_coeff_base == nullptr
               ? nullptr
               : prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16;
+      // The bias was rotated at the key's LOGICAL position, which is the
+      // rotary position rather than the offset into this request's cache.
+      // They differ whenever a request starts partway through a sequence,
+      // as under prefix reuse, so the correction must use the same base the
+      // rotary path uses.
+      const uint32_t prebias_pos_base =
+          kv_idx_base +
+          (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]);
       compute_qk<KTraits, has_maybe_prebias_coeff_v<Params> && !KTraits::K_STAGED &&
                        !KTraits::SCORE_CORR>(
           &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag, prebias_coeff_head,
@@ -3292,16 +3300,16 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                               s_frag);
           } else if constexpr (KTraits::SCORE_LEVEL == 6) {
             compute_score_correction_direct<KTraits>(
-                &smem_storage, &qt_smem_offset_r, kv_idx_base, params.rope_rcp_scale,
+                &smem_storage, &qt_smem_offset_r, prebias_pos_base, params.rope_rcp_scale,
                 params.rope_rcp_theta, lane_idx, s_frag);
           } else if constexpr (KTraits::SCORE_LEVEL == 9) {
             compute_score_correction_tabbed_paired<KTraits>(
                 &smem_storage,
                 get_warp_idx_q<KTraits>(tid.y) * KTraits::NUM_MMA_Q * 16 + lane_idx % 16,
-                lane_idx / 16, kv_idx_base, lane_idx, s_frag);
+                lane_idx / 16, prebias_pos_base, lane_idx, s_frag);
           } else if constexpr (KTraits::SCORE_LEVEL == 8) {
             compute_score_correction_tabbed<KTraits>(&smem_storage, &qt_smem_offset_r,
-                                                     kv_idx_base, lane_idx, s_frag);
+                                                     prebias_pos_base, lane_idx, s_frag);
           } else if constexpr (KTraits::SCORE_LEVEL == 7) {
             compute_score_correction_paired<KTraits>(
                 &smem_storage,
