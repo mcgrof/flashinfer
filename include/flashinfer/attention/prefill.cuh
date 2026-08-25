@@ -77,6 +77,17 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 // a score factorises into a per-query-head vector against a
 // per-position cosine/sine basis, so it can be applied as one extra
 // matmul over the whole tile instead of an add on every key element.
+// 0  off
+// 2  fold the query only: no basis, no correction matmul
+// 3  also generate and store the basis, still no correction matmul
+// 4  prefill the basis once, then run the correction matmul per tile
+// 5  the complete correction: basis per tile and matmul per tile
+//
+// Levels 2 to 4 are diagnostics that separate the cost components; only
+// level 5 is a deployable kernel.  Level 4 keeps the shared-memory layout
+// and matmul loop of level 5 but generates the basis once instead of per
+// tile, which isolates the matmul and its shared-memory reads from the
+// cost of producing the basis.
 #ifndef FLASHINFER_PREBIAS_SCORE
 #define FLASHINFER_PREBIAS_SCORE 0
 #endif
@@ -165,8 +176,9 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           typename AttentionVariant_, typename DTypeV_ = DTypeKV_, bool K_STAGED_ = false,
           typename DTypeKGmem_ = DTypeKV_, bool SCORE_CORR_ = false>
 struct KernelTraits {
-  // Score-domain bias correction compiled in.
+  // Score-domain bias correction compiled in, and which of its parts.
   static constexpr bool SCORE_CORR = SCORE_CORR_;
+  static constexpr int SCORE_LEVEL = SCORE_CORR_ ? FLASHINFER_PREBIAS_SCORE : 0;
   // Staged pre-bias K: the global-memory K cache is one byte wide
   // (DTypeKGmem_) while the shared-memory tile and the QK loop use the
   // 16-bit DTypeKV_.  A producer stages the one-byte tile and a
@@ -2727,6 +2739,14 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
             &qo_smem, &smem_storage,
             prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16,
             (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
+        if constexpr (KTraits::SCORE_LEVEL == 4) {
+          // Diagnostic: fill the basis once with valid values so the tile
+          // loop measures the matmul and its shared-memory reads without
+          // the cost of producing the basis.
+          build_position_basis<KTraits>(&smem_storage, 0, params.rope_rcp_scale,
+                                        params.rope_rcp_theta,
+                                        get_warp_idx_kv<KTraits>(tid.z), lane_idx);
+        }
       }
       block.sync();
     }
@@ -2922,11 +2942,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           rope_freq, prebias_rope_table, KTraits::NUM_MMA_D_QK * 16, kv_idx_base, lane_idx);
       if constexpr (KTraits::SCORE_CORR) {
         if (prebias_coeff_base != nullptr) {
-          build_position_basis<KTraits>(
-              &smem_storage, chunk_start + iter * CTA_TILE_KV, params.rope_rcp_scale,
-              params.rope_rcp_theta, get_warp_idx_kv<KTraits>(tid.z), lane_idx);
-          compute_score_correction<KTraits>(&smem_storage, &qt_smem_offset_r, &psi_smem_offset_r,
-                                            s_frag);
+          if constexpr (KTraits::SCORE_LEVEL == 3 || KTraits::SCORE_LEVEL == 5) {
+            build_position_basis<KTraits>(
+                &smem_storage, chunk_start + iter * CTA_TILE_KV, params.rope_rcp_scale,
+                params.rope_rcp_theta, get_warp_idx_kv<KTraits>(tid.z), lane_idx);
+          }
+          if constexpr (KTraits::SCORE_LEVEL >= 4) {
+            compute_score_correction<KTraits>(&smem_storage, &qt_smem_offset_r, &psi_smem_offset_r,
+                                              s_frag);
+          }
         }
       }
       logits_transform<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
@@ -3241,7 +3265,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   // The score-domain correction leaves the key cache one byte wide and
   // instead holds a 16-bit basis tile for the tile's positions.
   constexpr bool SCORE_CORR =
-      FLASHINFER_PREBIAS_SCORE && has_maybe_prebias_coeff_v<Params>;
+      (FLASHINFER_PREBIAS_SCORE >= 2) && has_maybe_prebias_coeff_v<Params>;
   using DTypeKSmem = std::conditional_t<K_STAGED, DTypeQ, DTypeKV>;
   constexpr size_t K_SMEM_BYTES = (K_STAGED ? sizeof(DTypeQ) + sizeof(DTypeK)
                                             : sizeof(DTypeK)) +
