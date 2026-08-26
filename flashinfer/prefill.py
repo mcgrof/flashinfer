@@ -2223,6 +2223,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         prebias_coeff: Optional[torch.Tensor] = None,
         prebias_rope_table: Optional[torch.Tensor] = None,
         prebias_pos_base: Optional[torch.Tensor] = None,
+        prebias_position_contract: str = "EXPLICIT_BASE",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2534,6 +2535,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
+            if prebias_coeff is not None:
+                # The prefill path took a position base without checking it,
+                # so a caller could omit it here and have omission silently
+                # mean zero -- exactly what the decode path refuses.
+                from .decode import _validate_prebias_position
+
+                prebias_pos_base = _validate_prebias_position(
+                    prebias_pos_base,
+                    int(self._qo_indptr_buf.shape[0] - 1),
+                    q.device,
+                    prebias_position_contract,
+                )
             self._cached_module.paged_run(
                 *run_args,
                 maybe_prebias_coeff=prebias_coeff,
