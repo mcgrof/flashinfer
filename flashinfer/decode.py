@@ -597,6 +597,63 @@ def single_decode_with_kv_cache(
         return out
 
 
+
+def _validate_prebias_position(pos_base, batch_size, device, contract):
+    """A position is an integer, and omitting it is not a way of saying zero.
+
+    The correction rotates the key bias at the absolute rotary position of
+    the first key held in cache slot zero for each request. That is not the
+    query start, the number of cached tokens, the physical page index, or
+    the prefix-hit length, and a caller that means zero has to say zero.
+
+    Correct behaviour that is optional is a future incident, so the strict
+    contract is the default and the permissive one has to be named.
+    """
+    if contract not in ("EXPLICIT_BASE", "ZERO_BASE_ONLY"):
+        raise ValueError(
+            f"unknown pre-bias position contract {contract!r}; "
+            f"expected EXPLICIT_BASE or ZERO_BASE_ONLY"
+        )
+    if pos_base is None:
+        if contract == "ZERO_BASE_ONLY":
+            return None
+        raise ValueError(
+            "pre-bias is enabled but no logical position base was supplied. "
+            "Pass one absolute position per request, explicitly zero for an "
+            "ordinary zero-based cache, or select the narrowly scoped "
+            "ZERO_BASE_ONLY contract if every request is known to start at "
+            "position zero. Omission is not accepted as meaning zero."
+        )
+    if pos_base.ndim != 1 or pos_base.shape[0] != batch_size:
+        raise ValueError(
+            f"pre-bias position base must have shape [{batch_size}], got "
+            f"{tuple(pos_base.shape)}"
+        )
+    if pos_base.device != device:
+        raise ValueError(
+            f"pre-bias position base is on {pos_base.device}, expected {device}"
+        )
+    if not pos_base.is_contiguous():
+        raise ValueError("pre-bias position base must be contiguous")
+    f = pos_base.float()
+    if not bool(torch.isfinite(f).all()):
+        raise ValueError("pre-bias position base contains non-finite values")
+    if bool((f < 0).any()):
+        raise ValueError("pre-bias position base contains negative positions")
+    if bool((f != f.floor()).any()):
+        raise ValueError(
+            "pre-bias position base contains fractional values; a position is "
+            "an integer"
+        )
+    if bool((f >= float(2 ** 24)).any()):
+        raise ValueError(
+            "pre-bias position base exceeds 2^24, beyond which the float "
+            "plumbing is no longer exact; supply an integer tensor or reduce "
+            "the position"
+        )
+    return pos_base
+
+
 class BatchDecodeWithPagedKVCacheWrapper:
     r"""Wrapper class for decode attention with paged kv-cache (first proposed in
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
@@ -1269,6 +1326,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         prebias_coeff: Optional[torch.Tensor] = None,
         prebias_rope_table: Optional[torch.Tensor] = None,
         prebias_pos_base: Optional[torch.Tensor] = None,
+        prebias_position_contract: str = "EXPLICIT_BASE",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -1511,6 +1569,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     True,  # uses_shared_paged_kv_idx
                 ]
 
+            if prebias_coeff is not None:
+                prebias_pos_base = _validate_prebias_position(
+                    prebias_pos_base,
+                    int(self._qo_indptr_buf.shape[0] - 1)
+                    if getattr(self, "_qo_indptr_buf", None) is not None
+                    else int(q.shape[0]),
+                    q.device,
+                    prebias_position_contract,
+                )
             self._cached_module.paged_run(
                 *run_args,
                 maybe_prebias_coeff=prebias_coeff,
