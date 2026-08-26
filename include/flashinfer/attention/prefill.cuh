@@ -73,6 +73,27 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
   }
 }
 
+// Deliberate defects, for the test that has to prove it can see them.
+//
+// A mapping fault changes no arithmetic: the values are all correct and land
+// on the wrong coordinates. Both faults ever found in this kernel were of
+// that kind, and neither was caught by an accuracy check. So the test that
+// guards them recreates them here, inside the kernel, rather than mutating a
+// host reference and hoping the consequence survives softmax.
+//
+//   0  none, the production path
+//   1  give the correction operand the query-side lane map     (historical)
+//   2  omit restoration of the read offset                     (historical)
+//   3  shift the logical position by one
+//   4  use the physical page index as the position
+//   5  swap the rotary halves
+//   6  bind one key head's coefficients to its neighbour
+//
+// Compiled out entirely unless asked for; production modules build with 0.
+#ifndef FLASHINFER_PREBIAS_MUTATION
+#define FLASHINFER_PREBIAS_MUTATION 0
+#endif
+
 // Compile the score-domain bias correction.  The bias contribution to
 // a score factorises into a per-query-head vector against a
 // per-position cosine/sine basis, so it can be applied as one extra
@@ -935,7 +956,11 @@ __device__ __forceinline__ void compute_score_correction_direct(
       }
     }
   }
+#if FLASHINFER_PREBIAS_MUTATION != 2
+  // omitting this is the second historical defect: every tile after the
+  // first then reads the folded query from a drifted offset
   *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+#endif
 }
 
 // As the register-direct correction, but pairing the halves.
@@ -1093,7 +1118,11 @@ __device__ __forceinline__ void compute_score_correction_tabbed(
       }
     }
   }
+#if FLASHINFER_PREBIAS_MUTATION != 2
+  // omitting this is the second historical defect: every tile after the
+  // first then reads the folded query from a drifted offset
   *qt_smem_offset_r -= KTraits::NUM_MMA_D_QK * 2;
+#endif
 }
 
 // The table-backed correction, additionally pairing the halves.
@@ -1133,11 +1162,21 @@ __device__ __forceinline__ void compute_score_correction_tabbed_paired(
     float pc[4], ps[4], rc[4], rs[4];
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
+#if FLASHINFER_PREBIAS_MUTATION == 1
+      // the query-side lane map on an operand that sits in the key position
+      const uint32_t fi = mma_d * 16 + (lane_idx % 16);
+#else
       const uint32_t fi = mma_d * 16 + 8 * (j / 2) + (lane_idx % 4) * 2 + (j % 2);
+#endif
       const float f = tab[3 * fi + 0];
       rc[j] = tab[3 * fi + 1];
       rs[j] = tab[3 * fi + 2];
+#if FLASHINFER_PREBIAS_MUTATION == 3
+      // position shifted by one
+      __sincosf(float(kv_idx_base + lane_idx / 4 + 1) * f, &ps[j], &pc[j]);
+#else
       __sincosf(float(kv_idx_base + lane_idx / 4) * f, &ps[j], &pc[j]);
+#endif
     }
 
 #pragma unroll
@@ -1149,10 +1188,18 @@ __device__ __forceinline__ void compute_score_correction_tabbed_paired(
         const float c0 = pc[j], s0 = ps[j];
         const float c1 = c0 * rc[j] - s0 * rs[j];
         const float s1 = s0 * rc[j] + c0 * rs[j];
+#if FLASHINFER_PREBIAS_MUTATION == 5
+        // halves swapped: the lower half must take the cosine
+        bl[j] = DTypeQ(s0);
+        bl[4 + j] = DTypeQ(s1);
+        bh[j] = DTypeQ(c0);
+        bh[4 + j] = DTypeQ(c1);
+#else
         bl[j] = DTypeQ(c0);
         bl[4 + j] = DTypeQ(c1);
         bh[j] = DTypeQ(s0);
         bh[4 + j] = DTypeQ(s1);
+#endif
         pc[j] = c1 * rc[j] - s1 * rs[j];
         ps[j] = s1 * rc[j] + c1 * rs[j];
       }
@@ -3071,9 +3118,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       cp_async::wait_group<0>();
       block.sync();
       if (prebias_coeff_base != nullptr) {
+#if FLASHINFER_PREBIAS_MUTATION == 6
+        // a neighbouring head's coefficients
+        const uint32_t coeff_head = (kv_head_idx + 1) % paged_kv.num_heads;
+#else
+        const uint32_t coeff_head = kv_head_idx;
+#endif
         build_folded_query<KTraits>(
             &qo_smem, &smem_storage,
-            prebias_coeff_base + kv_head_idx * 2 * KTraits::NUM_MMA_D_QK * 16,
+            prebias_coeff_base + coeff_head * 2 * KTraits::NUM_MMA_D_QK * 16,
             (tid.z * KTraits::NUM_WARPS_Q + tid.y) * 32 + tid.x);
         if constexpr (KTraits::SCORE_LEVEL == 8 || KTraits::SCORE_LEVEL == 9) {
           build_rope_table<KTraits>(&smem_storage, params.rope_rcp_scale,
