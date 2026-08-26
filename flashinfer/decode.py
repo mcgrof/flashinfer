@@ -635,23 +635,18 @@ def _validate_prebias_position(pos_base, batch_size, device, contract):
         )
     if not pos_base.is_contiguous():
         raise ValueError("pre-bias position base must be contiguous")
-    f = pos_base.float()
-    if not bool(torch.isfinite(f).all()):
-        raise ValueError("pre-bias position base contains non-finite values")
-    if bool((f < 0).any()):
+    if pos_base.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            f"pre-bias position base must be an integer tensor, got "
+            f"{pos_base.dtype}. A position is an integer; carrying it as "
+            f"float made the contract depend on where floating point stops "
+            f"being exact."
+        )
+    if bool((pos_base < 0).any()):
         raise ValueError("pre-bias position base contains negative positions")
-    if bool((f != f.floor()).any()):
-        raise ValueError(
-            "pre-bias position base contains fractional values; a position is "
-            "an integer"
-        )
-    if bool((f >= float(2 ** 24)).any()):
-        raise ValueError(
-            "pre-bias position base exceeds 2^24, beyond which the float "
-            "plumbing is no longer exact; supply an integer tensor or reduce "
-            "the position"
-        )
-    return pos_base
+    if bool((pos_base > torch.iinfo(torch.int32).max).any()):
+        raise ValueError("pre-bias position base exceeds the 32-bit range")
+    return pos_base.to(torch.int32) if pos_base.dtype != torch.int32 else pos_base
 
 
 class BatchDecodeWithPagedKVCacheWrapper:

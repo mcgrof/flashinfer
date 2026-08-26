@@ -1062,10 +1062,11 @@ def gen_batch_prefill_module(
             additional_tensor_dtypes.append("float")
             additional_tensor_names.append("maybe_prebias_rope_table")
             additional_tensor_dtypes.append("float")
-            # per-request logical start position; float keeps the existing
-            # plumbing and is exact for any position below 2^24
+            # per-request logical start position. A position is an integer;
+            # carrying it as float worked only below 2^24 and made the
+            # contract depend on a floating-point exactness boundary.
             additional_tensor_names.append("maybe_prebias_pos_base")
-            additional_tensor_dtypes.append("float")
+            additional_tensor_dtypes.append("int32_t")
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
