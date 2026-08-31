@@ -116,11 +116,12 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 // output isolates the correction and any mis-mapped position or head half
 // shows up directly. See scripts/prebias_lane_map_oracle.py.
 //
-// Levels 2 to 4 are diagnostics that separate the cost components; only
-// level 5 is a deployable kernel.  Level 4 keeps the shared-memory layout
-// and matmul loop of level 5 but generates the basis once instead of per
-// tile, which isolates the matmul and its shared-memory reads from the
-// cost of producing the basis.
+// Levels 2 to 5 are diagnostics that separate the cost components and
+// earlier staging designs. Levels 6 to 9 build the correction operand in
+// registers; level 8 adds the per-thread-block rotary table and level 9
+// additionally pairs the head halves that share a rotary frequency. The
+// deployable kernel, and the default below, is level 9; the measurements
+// that accepted it are recorded with the harness in knlp-key-results.
 #ifndef FLASHINFER_PREBIAS_SCORE
 #define FLASHINFER_PREBIAS_SCORE 9
 #endif
