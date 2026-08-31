@@ -1870,30 +1870,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if v_data_type is None:
             v_data_type = kv_data_type
         v_data_type = canonicalize_torch_dtype(v_data_type)
-        # Fail-closed: the CUDA prefill kernel template still
-        # assumes DTypeK == DTypeV internally (prefill.cuh
-        # uses unified DTypeKV).  Until the kernel refactor
-        # lands, asymmetric prefill must not reach NVCC — a
-        # cast-based silence would let the kernel misread
-        # FP8 memory as BF16 and corrupt output silently.
-        if k_data_type != v_data_type and not os.environ.get(
-            "FLASHINFER_EXPERIMENTAL_ASYM_PREFILL"
-        ):
-            raise NotImplementedError(
-                "FlashInfer paged prefill does not yet support"
-                " asymmetric K/V dtypes: k_data_type="
-                f"{k_data_type}, v_data_type={v_data_type}. "
-                "The Python/JIT path now reaches the intended"
-                " asymmetric specialization, but prefill.cuh"
-                " still uses a unified DTypeKV internally"
-                " (e.g. line 1758: 'DTypeKV* v = params.v')."
-                " The fix is a CUDA template refactor that"
-                " splits DTypeKV into DTypeK and DTypeV with"
-                " trait-based FP8 dispatch (is_fp8<DTypeV>),"
-                " not a sizeof()-based byte-width test."
-                " Set FLASHINFER_EXPERIMENTAL_ASYM_PREFILL=1"
-                " to force JIT compile during refactor."
-            )
+        # The generic kernel carries the key/value dtype split; the Hopper
+        # mainloop does not, and instantiating it with two dtypes fails to
+        # compile. An asymmetric pair therefore takes the generic backend
+        # when the choice is automatic, and is refused if the Hopper one
+        # was asked for by name.
+        if k_data_type != v_data_type:
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise NotImplementedError(
+                    f"asymmetric key/value dtypes (k={k_data_type}, "
+                    f"v={v_data_type}) are supported by the fa2 backend "
+                    f"only; the {self._backend} kernel has a single cache "
+                    "dtype. Use backend='fa2' or 'auto'."
+                )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
@@ -3018,30 +3009,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if v_data_type is None:
             v_data_type = kv_data_type
         v_data_type = canonicalize_torch_dtype(v_data_type)
-        # Fail-closed: the CUDA prefill kernel template still
-        # assumes DTypeK == DTypeV internally (prefill.cuh
-        # uses unified DTypeKV).  Until the kernel refactor
-        # lands, asymmetric prefill must not reach NVCC — a
-        # cast-based silence would let the kernel misread
-        # FP8 memory as BF16 and corrupt output silently.
-        if k_data_type != v_data_type and not os.environ.get(
-            "FLASHINFER_EXPERIMENTAL_ASYM_PREFILL"
-        ):
-            raise NotImplementedError(
-                "FlashInfer paged prefill does not yet support"
-                " asymmetric K/V dtypes: k_data_type="
-                f"{k_data_type}, v_data_type={v_data_type}. "
-                "The Python/JIT path now reaches the intended"
-                " asymmetric specialization, but prefill.cuh"
-                " still uses a unified DTypeKV internally"
-                " (e.g. line 1758: 'DTypeKV* v = params.v')."
-                " The fix is a CUDA template refactor that"
-                " splits DTypeKV into DTypeK and DTypeV with"
-                " trait-based FP8 dispatch (is_fp8<DTypeV>),"
-                " not a sizeof()-based byte-width test."
-                " Set FLASHINFER_EXPERIMENTAL_ASYM_PREFILL=1"
-                " to force JIT compile during refactor."
-            )
+        # The generic kernel carries the key/value dtype split; the Hopper
+        # mainloop does not, and instantiating it with two dtypes fails to
+        # compile. An asymmetric pair therefore takes the generic backend
+        # when the choice is automatic, and is refused if the Hopper one
+        # was asked for by name.
+        if k_data_type != v_data_type:
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise NotImplementedError(
+                    f"asymmetric key/value dtypes (k={k_data_type}, "
+                    f"v={v_data_type}) are supported by the fa2 backend "
+                    f"only; the {self._backend} kernel has a single cache "
+                    "dtype. Use backend='fa2' or 'auto'."
+                )
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
