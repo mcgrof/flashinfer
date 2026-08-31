@@ -642,10 +642,16 @@ def _validate_prebias_position(pos_base, batch_size, device, contract):
             f"float made the contract depend on where floating point stops "
             f"being exact."
         )
-    if bool((pos_base < 0).any()):
-        raise ValueError("pre-bias position base contains negative positions")
-    if bool((pos_base > torch.iinfo(torch.int32).max).any()):
-        raise ValueError("pre-bias position base exceeds the 32-bit range")
+    # The value checks read the tensor back to the host. Under CUDA graph
+    # capture that is not a check but a capture failure, reported as
+    # cudaErrorStreamCaptureInvalidated from whichever kernel follows. The
+    # shape, device, layout and dtype checks above need no readback and
+    # always run; the value checks run whenever a readback is legal.
+    if not torch.cuda.is_current_stream_capturing():
+        if bool((pos_base < 0).any()):
+            raise ValueError("pre-bias position base contains negative positions")
+        if bool((pos_base > torch.iinfo(torch.int32).max).any()):
+            raise ValueError("pre-bias position base exceeds the 32-bit range")
     return pos_base.to(torch.int32) if pos_base.dtype != torch.int32 else pos_base
 
 
