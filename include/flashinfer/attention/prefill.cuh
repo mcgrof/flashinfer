@@ -122,7 +122,7 @@ __device__ __forceinline__ void k_frag_add_rotated_bias_table(
 // tile, which isolates the matmul and its shared-memory reads from the
 // cost of producing the basis.
 #ifndef FLASHINFER_PREBIAS_SCORE
-#define FLASHINFER_PREBIAS_SCORE 0
+#define FLASHINFER_PREBIAS_SCORE 9
 #endif
 
 // Compile the staged FP8-to-16-bit key expansion.  Measured slower
