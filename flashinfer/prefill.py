@@ -188,6 +188,9 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    *,
+    dtype_k: Optional[torch.dtype] = None,
+    dtype_v: Optional[torch.dtype] = None,
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -209,6 +212,8 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        dtype_k=dtype_k,
+        dtype_v=dtype_v,
     ).build_and_load()
 
 

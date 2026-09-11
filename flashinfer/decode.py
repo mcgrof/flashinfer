@@ -18,7 +18,7 @@ import functools
 import math
 import warnings
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -739,6 +739,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -790,6 +791,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Optional[Dict[str, Any]]
+            Keyword arguments to create the custom JIT module.  In particular,
+            ``dtype_k`` and ``dtype_v`` select an asymmetric live cache.
         """
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
@@ -801,23 +806,35 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 "cute-dsl backend does not support jit_args customization"
             )
         if jit_args is not None:
+            if jit_kwargs is None:
+                jit_kwargs = {}
             if use_tensor_cores:
                 self._jit_module = get_batch_prefill_jit_module(
                     jit_args[0],
                     gen_customize_batch_prefill_module(
-                        backend, *jit_args
+                        backend, *jit_args, **jit_kwargs
                     ).build_and_load(),
                 )
             else:
                 self._jit_module = get_batch_decode_jit_module(
                     jit_args[0],
-                    gen_customize_batch_decode_module(*jit_args).build_and_load(),
+                    gen_customize_batch_decode_module(
+                        *jit_args, **jit_kwargs
+                    ).build_and_load(),
                 )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_decode/prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
+            self._jit_k_data_type = canonicalize_torch_dtype(
+                jit_kwargs.get("dtype_k", jit_args[2])
+            )
+            self._jit_v_data_type = canonicalize_torch_dtype(
+                jit_kwargs.get("dtype_v", jit_args[2])
+            )
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+            self._jit_k_data_type = None
+            self._jit_v_data_type = None
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -1000,12 +1017,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
         # Mirror plan(): the workspace estimate must come from the same
-        # module the plan will use, and asymmetric dtypes are CUDA-core
-        # decode only.
-        if k_data_type != v_data_type and self._jit_module is not None:
-            raise NotImplementedError(
-                "Asymmetric K/V dtypes (k_data_type != v_data_type) are not "
-                "supported with a custom jit_args module."
+        # compile-time K/V dtype specialization.
+        if self._jit_module is not None and (
+            k_data_type != self._jit_k_data_type or v_data_type != self._jit_v_data_type
+        ):
+            raise ValueError(
+                "The requested K/V dtypes do not match the custom jit_args "
+                f"module ({self._jit_k_data_type}, {self._jit_v_data_type})."
             )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
@@ -1337,27 +1355,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
-        # Asymmetric K/V is implemented in the CUDA-core FA2 decode kernel
-        # only. The tensor-core path (including trtllm-gen and cute-dsl,
-        # which force use_tensor_cores) routes through prefill kernels that
-        # do not support split K/V dtypes yet; fail here with a clear error
-        # instead of a JIT-compile static_assert (fa2/fa3 prefill) or a
-        # silently symmetric module (trtllm-gen, cute-dsl). Custom jit_args
-        # modules were compiled with their own fixed dtypes, so asymmetric
-        # plan() requests cannot be honored by them either.
-        if k_data_type != v_data_type:
-            # H1: asymmetric bf16-K/fp8-V decode routes onto the tensor-core
-            # prefill-as-decode kernel (regular 16-bit fa2/fa3 family), which
-            # loads fp8 V and dequantizes to 16-bit before the PV MMA. The
-            # get_batch_prefill_module call below already threads dtype_k/dtype_v.
-            # Custom jit_args modules were compiled with one fixed KV dtype, so
-            # asymmetric plan() requests still cannot be honored by them.
-            if self._jit_module is not None:
-                raise NotImplementedError(
-                    "Asymmetric K/V dtypes are not supported with a custom "
-                    "jit_args module; the custom module was compiled with a "
-                    "single KV dtype."
-                )
+        # A custom module has fixed compile-time K/V dtypes.  Permit asymmetric
+        # custom modules, but fail closed if plan() asks for a different pair.
+        if self._jit_module is not None and (
+            k_data_type != self._jit_k_data_type or v_data_type != self._jit_v_data_type
+        ):
+            raise ValueError(
+                "The requested K/V dtypes do not match the custom jit_args "
+                f"module ({self._jit_k_data_type}, {self._jit_v_data_type})."
+            )
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
