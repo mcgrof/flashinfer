@@ -23,6 +23,7 @@
 
 #include "../../fastdiv.cuh"
 #include "../../math.cuh"
+#include "../../vec_dtypes.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
@@ -33,6 +34,17 @@ namespace flashinfer {
 
 using namespace cute;
 
+// A custom attention variant can expose these fields to turn the ordinary
+// paged-cache kernel into a single-pass mixed-tier cartridge kernel.  The page
+// table remains one logical sequence (cartridge pages followed by live pages),
+// while the source pointer is selected from the logical token position.
+DEFINE_HAS_MEMBER(cartridge_k_ptr)
+DEFINE_HAS_MEMBER(cartridge_v_ptr)
+DEFINE_HAS_MEMBER(cartridge_num_tokens)
+DEFINE_HAS_MEMBER(cartridge_k_page_stride)
+DEFINE_HAS_MEMBER(cartridge_v_page_stride)
+DEFINE_HAS_MEMBER(cartridge_decode_marker)
+
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL, bool MULTIITEMSCORING = false>
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
@@ -42,6 +54,11 @@ struct SparseCollectiveMainloop {
   // producer so the shared-memory V tile and the PV WGMMA stay 16-bit.
   using DTypeV = typename Ktraits::DTypeV;
   static constexpr bool IS_ASYM = !std::is_same_v<DTypeKV, DTypeV>;
+  static constexpr bool HAS_CARTRIDGE = has_cartridge_k_ptr_v<AdditionalParams> &&
+                                        has_cartridge_v_ptr_v<AdditionalParams> &&
+                                        has_cartridge_num_tokens_v<AdditionalParams> &&
+                                        has_cartridge_k_page_stride_v<AdditionalParams> &&
+                                        has_cartridge_v_page_stride_v<AdditionalParams>;
   using IdType = typename Ktraits::IdType;
   using TileShape_QKD = typename Ktraits::TileShape_QKD;
   using TileShape_PDV = typename Ktraits::TileShape_PDV;
@@ -279,7 +296,8 @@ struct SparseCollectiveMainloop {
 
     // FA3-style cooperative loading: store pre-computed base offset for each KV position
     int64_t my_kv_offset[2];  // Rolling buffer: page_idx * page_stride + entry_idx * stride_n
-    int parity = 0;           // Buffer parity for double buffering, toggled with ^= 1
+    int64_t my_cartridge_v_offset[2];
+    int parity = 0;  // Buffer parity for double buffering, toggled with ^= 1
 
     // Group organization based on partition strategy
     constexpr int NUM_KV_PER_ITER = decltype(size<1>(tKcK))::value;   // e.g., 12
@@ -302,14 +320,31 @@ struct SparseCollectiveMainloop {
           thread_in_group < NUM_ITERS_PER_GROUP && (!use_predicate || kv_idx_read < kv_len);
 
       if (valid_read) {
-        // Use divmod to find page and offset within page
-        uint32_t page_iter, entry_idx;
-        mainloop_params.page_size.divmod(kv_idx_read, page_iter, entry_idx);
-        IdType page_idx = kv_indices_ptr[page_iter];
-        // Pre-compute: page_idx * page_stride + entry_idx * stride_n
-        my_kv_offset[parity] = page_idx * k_page_stride + entry_idx * k_stride_n;
+        if constexpr (HAS_CARTRIDGE) {
+          if (kv_idx_read < mainloop_params.additional_params.cartridge_num_tokens) {
+            // Cartridge residency guarantees dense contiguous pages. Address
+            // its logical token directly: no divmod and no page-table load in
+            // the dominant shared-prefix portion of every attention scan.
+            my_kv_offset[parity] = int64_t(kv_idx_read) * k_stride_n;
+            my_cartridge_v_offset[parity] = int64_t(kv_idx_read) * v_stride_n;
+          } else {
+            uint32_t page_iter, entry_idx;
+            mainloop_params.page_size.divmod(kv_idx_read, page_iter, entry_idx);
+            IdType page_idx = kv_indices_ptr[page_iter];
+            my_kv_offset[parity] = page_idx * k_page_stride + entry_idx * k_stride_n;
+            my_cartridge_v_offset[parity] = 0;
+          }
+        } else {
+          uint32_t page_iter, entry_idx;
+          mainloop_params.page_size.divmod(kv_idx_read, page_iter, entry_idx);
+          IdType page_idx = kv_indices_ptr[page_iter];
+          my_kv_offset[parity] = page_idx * k_page_stride + entry_idx * k_stride_n;
+        }
       } else {
         my_kv_offset[parity] = 0;
+        if constexpr (HAS_CARTRIDGE) {
+          my_cartridge_v_offset[parity] = 0;
+        }
       }
     };
 
@@ -348,6 +383,181 @@ struct SparseCollectiveMainloop {
       }
     };
 
+    // Only the single K tile crossing the cartridge/live boundary needs
+    // per-vector pointer selection.  Every other K tile goes through the
+    // branch-free ordinary gather loader above.
+    auto load_boundary_k_with_gather = [&](auto&& tKsK, auto&& tKcK, int kv_tile_idx, int stage_idx,
+                                           bool use_predicate) {
+      if constexpr (HAS_CARTRIDGE) {
+        using Vec = AlignmentTypeKV;
+        constexpr int VecSize = sizeof(Vec) / sizeof(DTypeKV);
+        int kv_base_idx = kv_tile_idx * CTA_KV;
+        auto dst = recast<Vec>(flatten(tKsK(_, _, _, stage_idx)));
+        auto c = flatten(tKcK(_, _, _, kv_tile_idx));
+        constexpr unsigned FULL_MASK = 0xffffffff;
+        DTypeKV* cartridge_k_base = mainloop_params.additional_params.cartridge_k_ptr +
+                                    kv_head_idx * stride<2>(mainloop_params.layout_K);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(dst); ++i) {
+          auto coord = c(VecSize * i);
+          int kv_offset = get<0>(coord);
+          int d_idx = get<1>(coord);
+          int kv_idx = kv_base_idx + kv_offset;
+          bool guard = !use_predicate || kv_idx < kv_len;
+          int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
+          int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[parity], src_thread);
+          DTypeKV* base_ptr = kv_idx < mainloop_params.additional_params.cartridge_num_tokens
+                                  ? cartridge_k_base
+                                  : K_ptr_base;
+          Vec const* src_ptr = reinterpret_cast<Vec const*>(base_ptr + base_offset + d_idx);
+          cutlass::arch::cp_async_zfill<sizeof(Vec), cutlass::arch::CacheOperation::Global>(
+              &dst(i), src_ptr, guard);
+        }
+      }
+    };
+
+    // Cartridge V is always FP8 and is converted directly into the 16-bit V
+    // shared-memory tile.  A tile can straddle the cartridge/live boundary, so
+    // source selection is per vector.  For an asymmetric live cache the live
+    // side takes the same FP8->16-bit path; for an ordinary live cache it is a
+    // vectorized 16-byte 16-bit load.  This feeds the existing online-softmax
+    // mainloop: there is still one attention launch and one final output.
+    auto load_boundary_v_with_gather = [&](auto&& tVsV, auto&& tVcV, int kv_tile_idx, int stage_idx,
+                                           bool use_predicate) {
+      if constexpr (HAS_CARTRIDGE) {
+        using CartridgeV =
+            std::remove_pointer_t<decltype(mainloop_params.additional_params.cartridge_v_ptr)>;
+        using Native16 =
+            std::conditional_t<std::is_same_v<DTypeKV, cutlass::bfloat16_t>, nv_bfloat16, half>;
+        using VecOut = AlignmentTypeKV;                            // 16 bytes == 8 x DTypeKV
+        constexpr int VecSize = sizeof(VecOut) / sizeof(DTypeKV);  // 8 elements per vector
+        int kv_base_idx = kv_tile_idx * CTA_KV;
+        auto dst = recast<VecOut>(flatten(tVsV(_, _, _, stage_idx)));
+        auto c = flatten(tVcV(_, _, _, kv_tile_idx));
+        constexpr unsigned FULL_MASK = 0xffffffff;
+        constexpr int NVEC = size(dst);
+
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < NVEC; ++i) {
+          auto coord = c(VecSize * i);
+          int kv_offset = get<0>(coord);
+          int d_idx = get<1>(coord);
+          int kv_idx = kv_base_idx + kv_offset;
+          bool guard = !use_predicate || kv_idx < kv_len;
+          bool from_cartridge = kv_idx < mainloop_params.additional_params.cartridge_num_tokens;
+          int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
+          int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[parity], src_thread);
+
+          VecOut out_vec{};
+          DTypeKV* dst_reg = reinterpret_cast<DTypeKV*>(&out_vec);
+          if (guard && from_cartridge) {
+            base_offset = __shfl_sync(FULL_MASK, my_cartridge_v_offset[parity], src_thread);
+            uint2 packed = *reinterpret_cast<const uint2*>(
+                mainloop_params.additional_params.cartridge_v_ptr +
+                kv_head_idx * stride<2>(mainloop_params.layout_V) + base_offset + d_idx);
+            const CartridgeV* src_reg = reinterpret_cast<const CartridgeV*>(&packed);
+            vec_cast<Native16, __nv_fp8_e4m3>::template cast<VecSize>(
+                reinterpret_cast<Native16*>(dst_reg),
+                reinterpret_cast<const __nv_fp8_e4m3*>(src_reg));
+          } else if (guard) {
+            if constexpr (IS_ASYM) {
+              uint2 packed = *reinterpret_cast<const uint2*>(V_ptr_base + base_offset + d_idx);
+              const DTypeV* src_reg = reinterpret_cast<const DTypeV*>(&packed);
+              vec_cast<Native16, __nv_fp8_e4m3>::template cast<VecSize>(
+                  reinterpret_cast<Native16*>(dst_reg),
+                  reinterpret_cast<const __nv_fp8_e4m3*>(src_reg));
+            } else {
+              out_vec = *reinterpret_cast<const VecOut*>(V_ptr_base + base_offset + d_idx);
+            }
+          }
+          dst(i) = out_vec;
+        }
+      }
+    };
+
+    // The usual case for a cartridge tile: every row comes from the shared
+    // FP8 cartridge.  Keep source selection and live-cache state out of this
+    // hot loop; only load_boundary_v_with_gather handles token 632's split tile.
+    auto load_cartridge_only_v_with_gather = [&](auto&& tVsV, auto&& tVcV, int kv_tile_idx,
+                                                 int stage_idx) {
+      if constexpr (HAS_CARTRIDGE) {
+        using Native16 =
+            std::conditional_t<std::is_same_v<DTypeKV, cutlass::bfloat16_t>, nv_bfloat16, half>;
+        using VecOut = AlignmentTypeKV;
+        constexpr int VecSize = sizeof(VecOut) / sizeof(DTypeKV);
+        auto dst = recast<VecOut>(flatten(tVsV(_, _, _, stage_idx)));
+        auto c = flatten(tVcV(_, _, _, kv_tile_idx));
+        constexpr unsigned FULL_MASK = 0xffffffff;
+        constexpr int NVEC = size(dst);
+
+        if constexpr (has_cartridge_decode_marker_v<AdditionalParams>) {
+          // Decode's 64-row kernel has the register budget to front-load all
+          // FP8 reads. This exposes memory-level parallelism instead of
+          // serializing every LDG behind its convert+STS pair.
+          uint2 packed[NVEC];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < NVEC; ++i) {
+            auto coord = c(VecSize * i);
+            int kv_offset = get<0>(coord);
+            int d_idx = get<1>(coord);
+            int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
+            int64_t base_offset = __shfl_sync(FULL_MASK, my_cartridge_v_offset[parity], src_thread);
+            packed[i] = *reinterpret_cast<const uint2*>(
+                mainloop_params.additional_params.cartridge_v_ptr +
+                kv_head_idx * stride<2>(mainloop_params.layout_V) + base_offset + d_idx);
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < NVEC; ++i) {
+            VecOut out_vec;
+            vec_cast<Native16, __nv_fp8_e4m3>::template cast<VecSize>(
+                reinterpret_cast<Native16*>(&out_vec),
+                reinterpret_cast<const __nv_fp8_e4m3*>(&packed[i]));
+            dst(i) = out_vec;
+          }
+        } else {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < NVEC; ++i) {
+            auto coord = c(VecSize * i);
+            int kv_offset = get<0>(coord);
+            int d_idx = get<1>(coord);
+            int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
+            int64_t base_offset = __shfl_sync(FULL_MASK, my_cartridge_v_offset[parity], src_thread);
+            uint2 packed = *reinterpret_cast<const uint2*>(
+                mainloop_params.additional_params.cartridge_v_ptr +
+                kv_head_idx * stride<2>(mainloop_params.layout_V) + base_offset + d_idx);
+            VecOut out_vec;
+            vec_cast<Native16, __nv_fp8_e4m3>::template cast<VecSize>(
+                reinterpret_cast<Native16*>(&out_vec),
+                reinterpret_cast<const __nv_fp8_e4m3*>(&packed));
+            dst(i) = out_vec;
+          }
+        }
+      }
+    };
+
+    auto do_k_load = [&](int tile, bool pred) {
+      pipeline_k.producer_acquire(smem_pipe_write_k);
+      if constexpr (HAS_CARTRIDGE) {
+        bool cartridge_only =
+            (tile + 1) * CTA_KV <= mainloop_params.additional_params.cartridge_num_tokens;
+        bool live_only = tile * CTA_KV >= mainloop_params.additional_params.cartridge_num_tokens;
+        if (cartridge_only) {
+          DTypeKV* cartridge_k_base = mainloop_params.additional_params.cartridge_k_ptr +
+                                      kv_head_idx * stride<2>(mainloop_params.layout_K);
+          load_kv_with_gather(tKsK, tKcK, cartridge_k_base, tile, smem_pipe_write_k.index(), pred);
+        } else if (live_only) {
+          load_kv_with_gather(tKsK, tKcK, K_ptr_base, tile, smem_pipe_write_k.index(), pred);
+        } else {
+          load_boundary_k_with_gather(tKsK, tKcK, tile, smem_pipe_write_k.index(), pred);
+        }
+      } else {
+        load_kv_with_gather(tKsK, tKcK, K_ptr_base, tile, smem_pipe_write_k.index(), pred);
+      }
+      pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
+      ++smem_pipe_write_k;
+    };
+
     // Asymmetric K/V (16-bit K, FP8 V): load FP8 V from global memory,
     // dequantize to DTypeKV (16-bit) in registers, and store into the 16-bit V
     // shared-memory tile the PV WGMMA reads.  Addressing mirrors
@@ -358,7 +568,9 @@ struct SparseCollectiveMainloop {
     // Hopper PV WGMMA reads its V operand directly from shared memory.
     auto load_v_with_gather_dequant = [&](auto&& tVsV, auto&& tVcV, DTypeV* base_ptr,
                                           int kv_tile_idx, int stage_idx, bool use_predicate) {
-      using VecOut = AlignmentTypeKV;                            // 16 bytes == 8 x DTypeKV
+      using VecOut = AlignmentTypeKV;  // 16 bytes == 8 x DTypeKV
+      using Native16 =
+          std::conditional_t<std::is_same_v<DTypeKV, cutlass::bfloat16_t>, nv_bfloat16, half>;
       constexpr int VecSize = sizeof(VecOut) / sizeof(DTypeKV);  // 8 elements per vector
       int kv_base_idx = kv_tile_idx * CTA_KV;
       auto dst = recast<VecOut>(flatten(tVsV(_, _, _, stage_idx)));  // 16-bit smem destination
@@ -396,10 +608,8 @@ struct SparseCollectiveMainloop {
         const DTypeV* src_reg = reinterpret_cast<const DTypeV*>(&packed[i]);
         VecOut out_vec;
         DTypeKV* dst_reg = reinterpret_cast<DTypeKV*>(&out_vec);
-        CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < VecSize; ++j) {
-          dst_reg[j] = static_cast<DTypeKV>(static_cast<float>(src_reg[j]));
-        }
+        vec_cast<Native16, __nv_fp8_e4m3>::template cast<VecSize>(
+            reinterpret_cast<Native16*>(dst_reg), reinterpret_cast<const __nv_fp8_e4m3*>(src_reg));
         dst(i) = out_vec;
       }
     };
@@ -410,7 +620,27 @@ struct SparseCollectiveMainloop {
     // not the cp.async barrier arrival.
     auto do_v_load = [&](int tile, bool pred) {
       pipeline_v.producer_acquire(smem_pipe_write_v);
-      if constexpr (IS_ASYM) {
+      if constexpr (HAS_CARTRIDGE) {
+        bool cartridge_only =
+            (tile + 1) * CTA_KV <= mainloop_params.additional_params.cartridge_num_tokens;
+        bool live_only = tile * CTA_KV >= mainloop_params.additional_params.cartridge_num_tokens;
+        if (cartridge_only) {
+          load_cartridge_only_v_with_gather(tVsV, tVcV, tile, smem_pipe_write_v.index());
+          pipeline_v.producer_commit(smem_pipe_write_v);
+        } else if (live_only) {
+          if constexpr (IS_ASYM) {
+            load_v_with_gather_dequant(tVsV, tVcV, V_ptr_base, tile, smem_pipe_write_v.index(),
+                                       pred);
+            pipeline_v.producer_commit(smem_pipe_write_v);
+          } else {
+            load_kv_with_gather(tVsV, tVcV, V_ptr_base, tile, smem_pipe_write_v.index(), pred);
+            pipeline_v.producer_commit(smem_pipe_write_v, cutlass::arch::cpasync_barrier_arrive);
+          }
+        } else {
+          load_boundary_v_with_gather(tVsV, tVcV, tile, smem_pipe_write_v.index(), pred);
+          pipeline_v.producer_commit(smem_pipe_write_v);
+        }
+      } else if constexpr (IS_ASYM) {
         load_v_with_gather_dequant(tVsV, tVcV, V_ptr_base, tile, smem_pipe_write_v.index(), pred);
         pipeline_v.producer_commit(smem_pipe_write_v);
       } else {
@@ -424,10 +654,7 @@ struct SparseCollectiveMainloop {
     // parity=0: prefetch kv_tile_idx -> my_kv_offset[0]
     {
       prefetch_kv_offset(kv_tile_idx, true);
-      pipeline_k.producer_acquire(smem_pipe_write_k);
-      load_kv_with_gather(tKsK, tKcK, K_ptr_base, kv_tile_idx, smem_pipe_write_k.index(), true);
-      pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
-      ++smem_pipe_write_k;
+      do_k_load(kv_tile_idx, true);
       // Note: don't toggle parity here, we reuse the same buffer for V below
     }
 
@@ -460,10 +687,7 @@ struct SparseCollectiveMainloop {
       int kv_tile_k = kv_tile_idx_decrement(kv_tile_idx);
       parity ^= 1;  // parity=1
       prefetch_kv_offset(kv_tile_k, false);
-      pipeline_k.producer_acquire(smem_pipe_write_k);
-      load_kv_with_gather(tKsK, tKcK, K_ptr_base, kv_tile_k, smem_pipe_write_k.index(), false);
-      pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
-      ++smem_pipe_write_k;
+      do_k_load(kv_tile_k, false);
 
       // Load V for kv_tile_idx using my_kv_offset[0]
       parity ^= 1;  // parity=0
@@ -481,10 +705,7 @@ struct SparseCollectiveMainloop {
         int kv_tile_k = kv_tile_idx_decrement(kv_tile_idx);
         parity ^= 1;  // Toggle to other buffer for prefetch
         prefetch_kv_offset(kv_tile_k, false);
-        pipeline_k.producer_acquire(smem_pipe_write_k);
-        load_kv_with_gather(tKsK, tKcK, K_ptr_base, kv_tile_k, smem_pipe_write_k.index(), false);
-        pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
-        ++smem_pipe_write_k;
+        do_k_load(kv_tile_k, false);
 
         // Load V for kv_tile_idx using the previous buffer
         parity ^= 1;  // Toggle back to kv_tile_idx's buffer

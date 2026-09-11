@@ -111,7 +111,7 @@ def _ref_decode(q, k, v, sm_scale):
 
 @pytest.mark.parametrize("batch_size", [7, 61])
 @pytest.mark.parametrize("kv_len", [54, 517])
-@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
@@ -191,7 +191,9 @@ def test_batch_decode_asymmetric_kv(
 @pytest.mark.parametrize("kv_len", [517, 2053])
 @pytest.mark.parametrize("batch_size", [3, 7])
 @pytest.mark.parametrize("v_dtype", V_DTYPES)
-def test_batch_decode_asymmetric_kv_high_group(num_qo_heads, kv_len, batch_size, v_dtype):
+def test_batch_decode_asymmetric_kv_high_group(
+    num_qo_heads, kv_len, batch_size, v_dtype
+):
     """High GQA group (g > 16) tensor-core decode: exercises the cooperative
     V-only FP8->BF16 repack (ASYM_COOP_V_DEQUANT). With num_kv_heads=1 the
     packed query length is num_qo_heads, so FA2DetermineCtaTileQ picks
@@ -225,9 +227,7 @@ def test_batch_decode_asymmetric_kv_high_group(num_qo_heads, kv_len, batch_size,
 
     # High g x split-KV needs a larger scratch than the symmetric tests: the
     # tensor-core prefill-as-decode path stages batch_prefill_tmp_v per split.
-    workspace_buffer = torch.empty(
-        256 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
-    )
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, use_tensor_cores=True
     )

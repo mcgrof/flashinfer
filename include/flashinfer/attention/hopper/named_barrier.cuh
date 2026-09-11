@@ -62,7 +62,7 @@ template <typename Ktraits, bool UseSchedulerBarrier>
 struct WarpScheduler {
   constexpr static int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
   static CUTLASS_DEVICE void barrier_sync() {
-    if constexpr (UseSchedulerBarrier) {
+    if constexpr (UseSchedulerBarrier && NUM_MMA_THREADS > cutlass::NumThreadsPerWarpGroup) {
       cutlass::arch::NamedBarrier::sync(
           NUM_MMA_THREADS, get_warp_group_barrier_idx(cutlass::canonical_warp_group_idx()));
     }
@@ -72,9 +72,13 @@ struct WarpScheduler {
     if constexpr (!UseSchedulerBarrier) {
       return;
     }
-    static_assert(NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup ||
+    static_assert(NUM_MMA_THREADS == cutlass::NumThreadsPerWarpGroup ||
+                  NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup ||
                   NUM_MMA_THREADS == 3 * cutlass::NumThreadsPerWarpGroup);
-    if constexpr (NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup) {
+    if constexpr (NUM_MMA_THREADS == cutlass::NumThreadsPerWarpGroup) {
+      // A single consumer warpgroup has nobody to round-robin with.
+      return;
+    } else if constexpr (NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup) {
       cutlass::arch::NamedBarrier::arrive(
           NUM_MMA_THREADS, get_warp_group_barrier_idx(get_next_consumer_warp_group_idx<2>()));
     } else {
@@ -89,10 +93,11 @@ struct WarpScheduler {
     // Tell producer (warp 0) that smem_q is ready
     cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                         /*id=*/static_cast<int>(NamedBarriers::kQueryEmpty));
-    if constexpr (!UseSchedulerBarrier) {
+    if constexpr (!UseSchedulerBarrier || NUM_MMA_THREADS == cutlass::NumThreadsPerWarpGroup) {
       return;
     }
-    static_assert(NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup ||
+    static_assert(NUM_MMA_THREADS == cutlass::NumThreadsPerWarpGroup ||
+                  NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup ||
                   NUM_MMA_THREADS == 3 * cutlass::NumThreadsPerWarpGroup);
     if (cutlass::canonical_warp_group_idx() > 1) {
       cutlass::arch::NamedBarrier::arrive(

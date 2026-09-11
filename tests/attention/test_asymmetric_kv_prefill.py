@@ -213,7 +213,7 @@ def test_batch_prefill_paged_asymmetric_kv(
     )
 
 
-@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("kv_len", [54, 129])
 @pytest.mark.parametrize("qo_len", [1, 17, 32])
 @pytest.mark.parametrize("batch_size", [1, 7])
@@ -738,9 +738,14 @@ def test_asymmetric_kv_fa3_explicit(head_dim, v_dtype):
 
     # --- single prefill (fa3) ---
     q = torch.randn(qo_len, num_qo_heads, head_dim, device="cuda:0", dtype=k_dtype)
-    k = torch.randn(kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=k_dtype) * 0.5
+    k = (
+        torch.randn(kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=k_dtype)
+        * 0.5
+    )
     v = (
-        torch.randn(kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float32)
+        torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float32
+        )
         * 0.5
     ).to(v_dtype)
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=causal, backend="fa3")

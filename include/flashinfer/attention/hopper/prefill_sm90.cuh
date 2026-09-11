@@ -171,6 +171,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   if (warp_group_idx == 0) {  // Producer
     if constexpr (use_tma_load_kv && !Ktraits::IS_ASYM) {
       cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
+    } else if constexpr (has_cartridge_decode_marker_v<
+                             decltype(mainloop_params.additional_params)>) {
+      // The decode-only 64-row specialization has just one producer and one
+      // consumer warpgroup, so it can leave substantially more registers with
+      // the cartridge gather/dequant producer without starving its consumer.
+      cutlass::arch::warpgroup_reg_dealloc<216>();
     } else {
       // Asymmetric K/V (and the paged path) run a full-warpgroup producer that
       // dequantizes FP8 V, which needs more registers than the TMA-only producer.
@@ -232,6 +238,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   } else {  // Consumer
     if constexpr (use_tma_load_kv && !Ktraits::IS_ASYM) {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
+    } else if constexpr (has_cartridge_decode_marker_v<
+                             decltype(mainloop_params.additional_params)>) {
+      cutlass::arch::warpgroup_reg_alloc<216>();
     } else {
       cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 216 : 144>();
     }
@@ -641,15 +650,29 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, bool enable_p
           LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
           params, stream);
     } else if constexpr (HEAD_DIM_VO == 128) {
-      BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
-          AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
-                                /*CTA_Q_=*/128,
-                                /*CTA_KV_=*/96,
-                                /*NUM_STAGES_=*/2, typename Params::DTypeQ,
-                                typename Params::DTypeKV, typename Params::DTypeO,
-                                typename Params::IdType, AttentionVariant, typename Params::DTypeV>,
-          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
-          params, stream);
+      if constexpr (has_cartridge_decode_marker_v<typename Params::AdditionalParams>) {
+        BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+            AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+                                  /*CTA_Q_=*/64,
+                                  /*CTA_KV_=*/128,
+                                  /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                  typename Params::DTypeKV, typename Params::DTypeO,
+                                  typename Params::IdType, AttentionVariant,
+                                  typename Params::DTypeV>,
+            LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+            params, stream);
+      } else {
+        BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+            AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+                                  /*CTA_Q_=*/128,
+                                  /*CTA_KV_=*/96,
+                                  /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                  typename Params::DTypeKV, typename Params::DTypeO,
+                                  typename Params::IdType, AttentionVariant,
+                                  typename Params::DTypeV>,
+            LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, Params, MULTIITEMSCORING>(
+            params, stream);
+      }
     } else {
       // HEAD_DIM == 256;
       // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
