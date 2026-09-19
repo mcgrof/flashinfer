@@ -84,14 +84,24 @@ def _reference(
 
 @pytest.mark.parametrize("live_v_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("decode", [False, True])
-def test_cartridge_mixed_paged_fa3(live_v_dtype: torch.dtype, decode: bool):
+@pytest.mark.parametrize(
+    ("page_size", "cartridge_num_tokens"),
+    [
+        pytest.param(8, 632, id="aligned-page8"),
+        pytest.param(1, 615, id="odd-page1"),
+    ],
+)
+def test_cartridge_mixed_paged_fa3(
+    live_v_dtype: torch.dtype,
+    decode: bool,
+    page_size: int,
+    cartridge_num_tokens: int,
+):
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("SM90A is required")
 
     torch.manual_seed(42)
     device = torch.device("cuda")
-    page_size = 8
-    cartridge_num_tokens = 632
     cartridge_num_pages = cartridge_num_tokens // page_size
     num_qo_heads = 32
     num_kv_heads = 8

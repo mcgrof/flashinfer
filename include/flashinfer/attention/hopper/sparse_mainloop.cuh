@@ -448,14 +448,15 @@ struct SparseCollectiveMainloop {
           bool from_cartridge = kv_idx < mainloop_params.additional_params.cartridge_num_tokens;
           int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
           int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[parity], src_thread);
+          int64_t cartridge_v_offset =
+              __shfl_sync(FULL_MASK, my_cartridge_v_offset[parity], src_thread);
 
           VecOut out_vec{};
           DTypeKV* dst_reg = reinterpret_cast<DTypeKV*>(&out_vec);
           if (guard && from_cartridge) {
-            base_offset = __shfl_sync(FULL_MASK, my_cartridge_v_offset[parity], src_thread);
             uint2 packed = *reinterpret_cast<const uint2*>(
                 mainloop_params.additional_params.cartridge_v_ptr +
-                kv_head_idx * stride<2>(mainloop_params.layout_V) + base_offset + d_idx);
+                kv_head_idx * stride<2>(mainloop_params.layout_V) + cartridge_v_offset + d_idx);
             const CartridgeV* src_reg = reinterpret_cast<const CartridgeV*>(&packed);
             vec_cast<Native16, __nv_fp8_e4m3>::template cast<VecSize>(
                 reinterpret_cast<Native16*>(dst_reg),
