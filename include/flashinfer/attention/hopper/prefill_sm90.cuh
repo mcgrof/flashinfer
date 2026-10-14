@@ -348,6 +348,7 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
                           params.o_stride_h),  // layout_O
           static_cast<float*>(params.lse_ptr),
           get_lse_gmem_layout(params.qo_len, params.num_qo_heads),  // layout_LSE
+          get_post_scale(params),
       });
 
   int num_tiles_q = cutlass::ceil_div(params.qo_len, KernelTraits::CTA_Q);
@@ -416,8 +417,10 @@ cudaError_t BatchPrefillWithPagedKVCacheKernelTraitsDispatched(Params& params,
           params.o_ptr,
           get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_VO,
                           params.o_stride_n,
-                          params.o_stride_h),                                       // layout_O
-          params.lse_ptr, get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
+                          params.o_stride_h),  // layout_O
+          params.lse_ptr,
+          get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
+          get_post_scale(params),
       });
 
   typename Scheduler::Arguments scheduler_args = {
@@ -490,8 +493,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
           params.o_ptr,
           get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM_VO,
                           params.o_stride_n,
-                          params.o_stride_h),                                       // layout_O
-          params.lse_ptr, get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
+                          params.o_stride_h),  // layout_O
+          params.lse_ptr,
+          get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),  // layout_LSE
+          get_post_scale(params),
       });
 
   // NOTE(Zihao): add support for kv head-major later

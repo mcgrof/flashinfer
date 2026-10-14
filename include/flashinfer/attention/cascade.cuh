@@ -19,6 +19,7 @@
 #include "../cp_async.cuh"
 #include "../math.cuh"
 #include "../utils.cuh"
+#include "post_scale.cuh"
 #include "state.cuh"
 
 namespace flashinfer {
@@ -368,7 +369,7 @@ template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stage
 __global__ void PersistentVariableLengthMergeStatesKernel(
     DTypeIn* __restrict__ V, float* __restrict__ S, IdType* indptr, DTypeO* __restrict__ v_merged,
     float* __restrict__ s_merged, uint32_t max_seq_len, uint32_t* __restrict__ seq_len_ptr,
-    uint32_t num_heads) {
+    uint32_t num_heads, float post_scale) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
@@ -397,6 +398,12 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
     if (num_index_sets == 0) {
       vec_t<DTypeO, vec_size> v;
       v.fill(DTypeO(0.f));
+      if (post_scale != 1.f) {
+#pragma unroll
+        for (uint32_t j = 0; j < vec_size; ++j) {
+          v[j] = rounded_post_scale<DTypeO>(static_cast<float>(v[j]), post_scale);
+        }
+      }
       v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
       if (s_merged != nullptr) {
         s_merged[pos * num_heads + head_idx] = -math::inf;
@@ -407,6 +414,12 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
     if (num_index_sets == 1) {
       vec_t<DTypeO, vec_size> v;
       v.cast_load(V + (indptr[pos] * num_heads + head_idx) * head_dim + tx * vec_size);
+      if (post_scale != 1.f) {
+#pragma unroll
+        for (uint32_t j = 0; j < vec_size; ++j) {
+          v[j] = rounded_post_scale<DTypeO>(static_cast<float>(v[j]), post_scale);
+        }
+      }
       v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
       if (s_merged != nullptr) {
         s_merged[pos * num_heads + head_idx] = S[indptr[pos] * num_heads + head_idx];
@@ -456,6 +469,12 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
     threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
     st.normalize();
 
+    if (post_scale != 1.f) {
+#pragma unroll
+      for (uint32_t j = 0; j < vec_size; ++j) {
+        st.o[j] = static_cast<float>(rounded_post_scale<DTypeO>(st.o[j], post_scale));
+      }
+    }
     st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
     if (s_merged != nullptr) {
       s_merged[pos * num_heads + head_idx] = st.get_lse();
@@ -687,7 +706,7 @@ template <typename DTypeIn, typename DTypeO, typename IdType>
 cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
                                       float* s_merged, uint32_t max_seq_len, uint32_t* seq_len,
                                       uint32_t num_heads, uint32_t head_dim, bool enable_pdl,
-                                      cudaStream_t stream = nullptr) {
+                                      cudaStream_t stream = nullptr, float post_scale = 1.f) {
   int dev_id = 0;
   int num_sms = 0;
   int num_blocks_per_sm = 0;
@@ -710,7 +729,8 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
 
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);
-    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &max_seq_len, &seq_len, &num_heads};
+    void* args[] = {&v,           &s,       &indptr,    &v_merged,  &s_merged,
+                    &max_seq_len, &seq_len, &num_heads, &post_scale};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -727,7 +747,7 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
       config.dynamicSmemBytes = smem_size;
       config.stream = stream;
       FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, v, s, indptr, v_merged, s_merged,
-                                              max_seq_len, seq_len, num_heads));
+                                              max_seq_len, seq_len, num_heads, post_scale));
     } else {
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }

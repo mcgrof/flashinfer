@@ -20,6 +20,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+
+#include "post_scale.cuh"
 #if CUDA_VERSION >= 12080
 #include <cuda_fp4.h>
 #endif
@@ -1485,6 +1487,11 @@ __device__ __forceinline__ void transform_output(
         o_frag[mma_q][mma_d][reg_id] = variant.OutputTransform(
             params, o_frag[mma_q][mma_d][reg_id], batch_idx, qo_idx, qo_head_idx,
             m[mma_q][(reg_id % 4) / 2], d[mma_q][(reg_id % 4) / 2], scale[mma_q][(reg_id % 4) / 2]);
+        if (!params.partition_kv && get_post_scale(params) != 1.f) {
+          o_frag[mma_q][mma_d][reg_id] =
+              static_cast<float>(rounded_post_scale<typename KTraits::DTypeO>(
+                  o_frag[mma_q][mma_d][reg_id], get_post_scale(params)));
+        }
       }
     }
   }
@@ -3886,7 +3893,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream,
+              get_post_scale(params)));
         } else {
           FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,

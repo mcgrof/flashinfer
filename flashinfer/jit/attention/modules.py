@@ -416,6 +416,14 @@ def get_batch_prefill_uri(
     dtype_k: Optional[torch.dtype] = None,
     dtype_v: Optional[torch.dtype] = None,
 ) -> str:
+    suffix = (
+        "_postscale_v1"
+        if dtype_q == torch.float16
+        and dtype_o == torch.float16
+        and (dtype_k or dtype_kv) == torch.float16
+        and (dtype_v or dtype_kv) == torch.float8_e4m3fn
+        else ""
+    )
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"{_kv_uri_fragment(dtype_kv, dtype_k, dtype_v)}_"
@@ -427,7 +435,7 @@ def get_batch_prefill_uri(
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
-    )
+    ) + suffix
 
 
 def get_batch_prefill_attention_sink_uri(
@@ -1116,6 +1124,16 @@ def gen_batch_prefill_module(
             additional_scalar_dtypes = ["double", "double", "double", "double"]
             variant_name = "DefaultFP8Attention"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+
+    mixed_post_scale = (
+        dtype_q == torch.float16
+        and dtype_o == torch.float16
+        and (dtype_k or dtype_kv) == torch.float16
+        and (dtype_v or dtype_kv) == torch.float8_e4m3fn
+    )
+    if mixed_post_scale:
+        additional_scalar_names.append("post_scale")
+        additional_scalar_dtypes.append("double")
 
     return gen_customize_batch_prefill_module(
         backend,

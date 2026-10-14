@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import functools
 import logging
 import math
@@ -457,6 +458,12 @@ def get_single_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
 
 @functools.cache
 def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
+    mixed_post_scale = (
+        args[0] == torch.float16
+        and args[2] == torch.float16
+        and (dtype_k or args[1]) == torch.float16
+        and (dtype_v or args[1]) == torch.float8_e4m3fn
+    )
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
@@ -549,6 +556,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta,
                 token_pos_in_items_len,
+                *([1.0] if mixed_post_scale else []),
             )
         elif is_fp8:
             # FA3 FP8: scale_q, scale_k, scale_v, sm_scale, scale_q_scalar, scale_k_scalar, scale_v_scalar
@@ -605,6 +613,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
                 sm_scale,
                 scale_v_scalar,
                 token_pos_in_items_len,
+                *([1.0] if mixed_post_scale else []),
             )
 
         return o
@@ -701,6 +710,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        post_output_scale: float = 1.0,
     ) -> None:
         if backend == "trtllm-gen":
             assert num_qo_heads is not None
@@ -772,6 +782,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
                 1.0 / rope_scale,  # rope_rcp_scale
                 1.0 / rope_theta,  # rope_rcp_theta
                 token_pos_in_items_len,
+                *([post_output_scale] if mixed_post_scale else []),
             )
         else:
             scale_v_tensor, scale_v_scalar = _split_scale_param(scale_v)
@@ -801,6 +812,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
                     sm_scale,
                     scale_v_scalar,
                     token_pos_in_items_len,
+                    *([post_output_scale] if mixed_post_scale else []),
                 )
             else:
                 scale_q_tensor, scale_q_scalar = _split_scale_param(scale_q)
@@ -880,6 +892,7 @@ def get_batch_prefill_module(backend, *args, dtype_k=None, dtype_v=None):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        post_output_scale: float = 1.0,
     ) -> None:
         pass
 
@@ -2885,10 +2898,26 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 ]
 
             assert self._cached_module is not None, "cached module is not initialized"
+            fuse_post_scale = (
+                self._jit_module is None
+                and self._backend in ("fa2", "fa3")
+                and q.dtype == torch.float16
+                and k_cache.dtype == torch.float16
+                and v_cache.dtype == torch.float8_e4m3fn
+                and out.dtype == torch.float16
+                and v_scale is not None
+                and os.environ.get("FLASHINFER_FUSE_V_SCALE", "0") == "1"
+            )
+            if fuse_post_scale:
+                if not isinstance(v_scale, (float, int)):
+                    raise ValueError(
+                        "fused mixed output requires a host scalar V scale"
+                    )
+                run_args.append(float(v_scale))
             self._cached_module.paged_run(*run_args)
 
             is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-            if v_scale is not None and not is_float_one:
+            if v_scale is not None and not is_float_one and not fuse_post_scale:
                 # TODO(Zihao): fused into kernel
                 if is_float8(out):
                     out = (out.to(torch.float32) * v_scale).to(out.dtype)

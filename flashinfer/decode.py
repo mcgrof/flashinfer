@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import os
 import functools
 import math
 import warnings
@@ -1753,6 +1754,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+        fuse_post_scale = False
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
@@ -2008,6 +2010,22 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         True,  # uses_shared_paged_kv_idx
                     ]
 
+            fuse_post_scale = (
+                self._jit_module is None
+                and self._backend in ("fa2", "fa3")
+                and q.dtype == torch.float16
+                and k_cache.dtype == torch.float16
+                and v_cache.dtype == torch.float8_e4m3fn
+                and out.dtype == torch.float16
+                and v_scale is not None
+                and os.environ.get("FLASHINFER_FUSE_V_SCALE", "0") == "1"
+            )
+            if fuse_post_scale:
+                if not isinstance(v_scale, (float, int)):
+                    raise ValueError(
+                        "fused mixed output requires a host scalar V scale"
+                    )
+                run_args.append(float(v_scale))
             self._cached_module.paged_run(*run_args)
         else:
             # trtllm-gen does not need plan info
@@ -2057,8 +2075,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             self._cached_module.run(*run_args)
 
+        fuse_post_scale = self._use_tensor_cores and fuse_post_scale
         is_float_one = isinstance(v_scale, float) and v_scale == 1.0
-        if v_scale is not None and not is_float_one:
+        if v_scale is not None and not is_float_one and not fuse_post_scale:
             # TODO(Zihao): fused into kernel
             if is_float8(out):
                 out = (out.to(torch.float32) * v_scale).to(out.dtype)

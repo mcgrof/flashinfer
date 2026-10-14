@@ -10,6 +10,7 @@
 #include <cutlass/cutlass.h>
 
 #include "../../math.cuh"
+#include "../post_scale.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "named_barrier.cuh"
@@ -129,6 +130,7 @@ struct CollectiveEpilogue {
     LayoutT const layout_O;
     float* lse_ptr;
     LayoutLseT const layout_LSE;
+    float post_scale = 1.f;
   };
 
   // Device side kernel params
@@ -137,11 +139,12 @@ struct CollectiveEpilogue {
     LayoutT const layout_O;
     float* lse_ptr;
     LayoutLseT const layout_LSE;
+    float post_scale = 1.f;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     Tensor mO = make_tensor(make_gmem_ptr(args.O_ptr), args.layout_O);
-    return {args.O_ptr, args.layout_O, args.lse_ptr, args.layout_LSE};
+    return {args.O_ptr, args.layout_O, args.lse_ptr, args.layout_LSE, args.post_scale};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -160,6 +163,13 @@ struct CollectiveEpilogue {
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
 
     Tensor tOrO_out = convert_type<DTypeO>(tOrO);
+    if (epilogue_params.post_scale != 1.f) {
+#pragma unroll
+      for (int i = 0; i < size(tOrO_out); ++i) {
+        tOrO_out(i) =
+            rounded_post_scale<DTypeO>(static_cast<float>(tOrO_out(i)), epilogue_params.post_scale);
+      }
+    }
     Tensor tOrO_retile = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor tOsO = smem_thr_copy_O.partition_D(sO);            // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
